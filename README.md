@@ -32,6 +32,10 @@ A secure, real-time chat system built in Rust with TLS encryption, featuring bot
 
 2. **Generate TLS certificates**
    ```bash
+   # Using the Makefile (recommended)
+   make certs
+   
+   # Or manually with the script
    chmod +x gencert.sh
    ./gencert.sh
    ```
@@ -42,6 +46,12 @@ A secure, real-time chat system built in Rust with TLS encryption, featuring bot
    # or manually:
    cargo build --release
    ```
+   
+   **Available Makefile targets:**
+   - `make all` - Build both server and client
+   - `make server` - Build server only
+   - `make client` - Build client only
+   - `make release` - Build optimized release versions
 
 ### Running
 
@@ -51,7 +61,7 @@ A secure, real-time chat system built in Rust with TLS encryption, featuring bot
    cargo run --bin chat -- --debug > server.log 2>&1 &
    
    # Or use the Makefile
-   make server
+   make run-server
    ```
 
 2. **Connect with a client**
@@ -63,8 +73,13 @@ A secure, real-time chat system built in Rust with TLS encryption, featuring bot
    cargo run --bin client -- --tui --server localhost:8443 --cert cert.pem
    
    # Or use the Makefile
-   make client
+   make run-client
    ```
+   
+   **Additional Makefile run targets:**
+   - `make dev-server` - Run server with cargo run (development mode)
+   - `make dev-client` - Run client with cargo run (development mode)
+   - `make demo` - Run server in background, then client (for testing)
 
 ## Usage
 
@@ -144,8 +159,17 @@ make all
 make server
 make client
 
+# Build optimized release versions
+make release
+
 # Clean build artifacts
 make clean
+
+# Generate TLS certificates
+make certs
+
+# Clean only certificates
+make clean-certs
 ```
 
 ### Testing
