@@ -37,7 +37,7 @@ pub fn format_timeout_message(nickname: &str) -> String {
 }
 
 pub fn format_nickname_change_message(old_nick: &str, new_nick: &str) -> String {
-    format_control_message(&format!("{}{} {}", old_nick, MESSAGE_NICKNAME_CHANGE, new_nick))
+    format_control_message(&format!("{} {} {}", old_nick, MESSAGE_NICKNAME_CHANGE, new_nick))
 }
 
 // Message parsing helpers
@@ -71,10 +71,34 @@ pub fn is_signed_message(message: &str) -> bool {
 
 // Server configuration
 pub const MAX_USERS: usize = 5;
-pub const MAX_LAST_SEEN_SECONDS: u64 = 10;
+pub const MAX_LAST_SEEN_SECONDS: u64 = 60; // Increased from 10 to 60 seconds
 pub const HEARTBEAT_CHECK_INTERVAL_SECONDS: u64 = 5;
+
+// Message signing constants
+pub const CLIENT_SIGNING_KEY_SIZE: usize = 32; // HMAC-SHA256 key size
+pub const MESSAGE_NONCE_SIZE: usize = 8; // Nonce counter size
+
+// Command constants
+pub const COMMAND_REGISTER_KEY: &str = "/register_key";
+pub const COMMAND_SIGNING_STATUS: &str = "/signing_status";
+pub const COMMAND_NICK: &str = "/nick";
+pub const COMMAND_WHO: &str = "/who";
+pub const COMMAND_STATUS: &str = "/status";
+pub const COMMAND_QUIT: &str = "/quit";
+
+// Response messages
+pub const RESPONSE_KEY_REGISTERED: &str = "Client signing key registered successfully";
+pub const RESPONSE_KEY_NOT_REGISTERED: &str = "Client signing key is not registered";
+pub const RESPONSE_KEY_ALREADY_REGISTERED: &str = "Client signing key is already registered";
+pub const RESPONSE_INVALID_KEY_FORMAT: &str = "Invalid key format. Use: /register_key <base64_encoded_key>";
+pub const RESPONSE_VERIFICATION_FAILED: &str = "Message verification failed";
+
+// Connection timeouts
+pub const CONNECTION_STABILIZATION_MS: u64 = 200;
+pub const KEY_REGISTRATION_WAIT_MS: u64 = 200;
 
 // Client configuration  
 pub const MAX_CHAT_HISTORY_LINES: usize = 1024;
 pub const HEARTBEAT_INTERVAL_MIN_MS: u64 = 1000;
 pub const HEARTBEAT_INTERVAL_MAX_MS: u64 = 3000;
+

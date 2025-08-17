@@ -14,8 +14,15 @@ client:
 run-server: server certs
 	./target/debug/chat
 
+runsd:
+	./target/debug/chat --debug |tee server.log 2>&1
+
+runs:
+	./target/release/chat --debug |tee server.log 2>&1
+
+
 run-client: client
-	./target/debug/client
+	./target/debug/client --server localhost --port 8443 --cert cert.pem
 
 # Generate TLS certificates
 certs:

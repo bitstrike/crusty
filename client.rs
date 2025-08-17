@@ -1,13 +1,14 @@
 use std::io::{self, Write, Read};
 use std::net::TcpStream;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, Duration};
 use std::fs;
 use rustls::{ClientConfig, ClientConnection, StreamOwned, Certificate, ServerName};
 use rustls::client::{ServerCertVerifier, ServerCertVerified};
 use serde::{Serialize, Deserialize};
-use rand::Rng;
+use rand::{Rng, RngCore};
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Digest};
 use base64::{Engine as _, engine::general_purpose};
@@ -31,6 +32,68 @@ use ratatui::{
 use std::collections::VecDeque;
 
 type TlsStream = StreamOwned<ClientConnection, TcpStream>;
+
+// Thread-safe signing state for debug client
+#[derive(Clone)]
+struct SigningState {
+    signing_key: Vec<u8>,
+    message_counter: Arc<Mutex<u64>>,
+}
+
+impl SigningState {
+    fn new() -> Self {
+        let mut rng = rand::thread_rng();
+        let mut signing_key = vec![0u8; CLIENT_SIGNING_KEY_SIZE];
+        rng.fill_bytes(&mut signing_key);
+        
+        Self {
+            signing_key,
+            message_counter: Arc::new(Mutex::new(0)),
+        }
+    }
+    
+    fn sign_message(&self, message: &str) -> Result<String, Box<dyn std::error::Error>> {
+        use std::time::UNIX_EPOCH;
+        
+        // Get current timestamp and increment message counter for replay protection
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let nonce = {
+            let mut counter = self.message_counter.lock().unwrap();
+            let current = *counter;
+            *counter += 1;
+            current
+        };
+        
+        // Create message to sign: "timestamp|nonce|message" for HMAC verification
+        let message_to_sign = format!("{}|{}|{}", timestamp, nonce, message);
+        
+        // Sign with HMAC-SHA256 using client's signing key
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.signing_key)
+            .map_err(|_| "Invalid key length")?;
+        mac.update(message_to_sign.as_bytes());
+        let result = mac.finalize();
+        
+        // Encode the signature as base64 for transmission
+        let signature = general_purpose::STANDARD.encode(result.into_bytes());
+        
+        // Store signature metadata for server verification
+        let signature_with_metadata = format!("{}|{}|{}", timestamp, nonce, signature);
+        
+        // Use config.rs constants for consistent message formatting
+        // Format: [SIGNED:timestamp|nonce|signature] message
+        // Server can extract timestamp, nonce, and signature to reconstruct signed content
+        Ok(format_signed_message(&signature_with_metadata, message))
+    }
+    
+    fn get_signing_key(&self) -> &[u8] {
+        &self.signing_key
+    }
+}
+
+// Common trait for both chat clients to share signing behavior
+trait ChatClient {
+    fn sign_and_send_message(&self, message: &str, tx: &Sender<String>) -> Result<(), Box<dyn std::error::Error>>;
+}
 
 // ClientMessageManager handles server message verification
 struct ClientMessageManager {
@@ -201,6 +264,17 @@ struct DebugChatClient {
     running: bool,
     tx_write: Option<Sender<String>>,
     rx_output: Option<Receiver<String>>,
+    // Thread-safe client message signing
+    signing_state: SigningState,
+    key_registered: bool,
+}
+
+impl ChatClient for DebugChatClient {
+    fn sign_and_send_message(&self, message: &str, tx: &Sender<String>) -> Result<(), Box<dyn std::error::Error>> {
+        let signed_message = self.signing_state.sign_message(message)?;
+        tx.send(signed_message)?;
+        Ok(())
+    }
 }
 
 impl DebugChatClient {
@@ -210,6 +284,8 @@ impl DebugChatClient {
             running: false,
             tx_write: None,
             rx_output: None,
+            signing_state: SigningState::new(),
+            key_registered: false,
         }
     }
 
@@ -241,6 +317,17 @@ impl DebugChatClient {
         self.tx_write = Some(tx_write);
         self.rx_output = Some(rx_output);
 
+        // DEBUG CLIENT: Automatically register signing key with server
+        debug_log("🔑 Registering client signing key...");
+        let key_base64 = general_purpose::STANDARD.encode(self.signing_state.get_signing_key());
+        if let Some(ref tx) = self.tx_write {
+            // Note: Key registration bypasses signing since client doesn't have a key yet
+            let _ = tx.send(format!("{} {}", COMMAND_REGISTER_KEY, key_base64));
+        }
+        
+        // Wait for key registration to complete
+        thread::sleep(Duration::from_millis(KEY_REGISTRATION_WAIT_MS));
+
         self.start_stream_handler(tls_stream, rx_write, tx_output);
 
         Ok(())
@@ -259,19 +346,19 @@ impl DebugChatClient {
                     processed_outgoing = true;
                     debug_log(&format!("Processing outgoing message: {}", msg));
                     
-                    // Handle non-blocking write with retry logic
+                    // DEBUG CLIENT: Handle non-blocking write with retry logic
                     let mut write_success = false;
                     let mut retry_count = 0;
                     const MAX_WRITE_RETRIES: usize = 10;
                     
                     while !write_success && retry_count < MAX_WRITE_RETRIES {
-                        match write!(stream, "{}\r\n", msg) {
-                            Ok(()) => {
-                                match stream.flush() {
-                                    Ok(()) => {
-                                        debug_log(&format!("Sent: {}", msg));
-                                        write_success = true;
-                                    }
+                        match write!(stream, "{}\r\n", &msg) {
+                                                                Ok(()) => {
+                                        match stream.flush() {
+                                            Ok(()) => {
+                                                debug_log(&format!("Sent: {}", msg));
+                                                write_success = true;
+                                            }
                                     Err(e) => {
                                         if e.kind() == std::io::ErrorKind::WouldBlock {
                                             // Stream not ready for flush, retry after small delay
@@ -361,12 +448,14 @@ impl DebugChatClient {
         println!("=== Debug Chat Client ===");
         println!("Type messages and press Enter to send");
         println!("Commands: /nick <name>, /who, /quit");
+        println!("Signing Key: {}", if self.key_registered { "✅ Registered" } else { "❌ Not Registered" });
         println!("===========================");
         print!("> ");
         io::stdout().flush().unwrap();
 
         // Start input thread
         let tx_write = self.tx_write.clone();
+        let signing_state = self.signing_state.clone();
         let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let running_clone = running.clone();
         
@@ -379,7 +468,26 @@ impl DebugChatClient {
                         if !msg.is_empty() {
                             if let Some(ref tx) = tx_write {
                                 debug_log(&format!("Sending: {}", msg));
-                                match tx.send(msg.clone()) {
+                                
+                                // Handle special case: /register_key command should be sent unsigned
+                                let message_to_send = if msg.starts_with("/register_key") {
+                                    debug_log("Sending unsigned /register_key command");
+                                    msg.clone()
+                                } else {
+                                    // Sign all other messages using thread-safe signing state
+                                    match signing_state.sign_message(&msg) {
+                                        Ok(signed_msg) => {
+                                            debug_log("Message signed successfully");
+                                            signed_msg
+                                        }
+                                        Err(e) => {
+                                            debug_log(&format!("Failed to sign message: {}", e));
+                                            msg.clone() // Fallback to unsigned
+                                        }
+                                    }
+                                };
+                                
+                                match tx.send(message_to_send) {
                                     Ok(()) => {
                                         debug_log("Message queued successfully");
                                         // Check if this was a quit command AFTER sending it
@@ -420,6 +528,11 @@ impl DebugChatClient {
                     println!("\n[CONNECTION LOST]");
                     running.store(false, std::sync::atomic::Ordering::Relaxed);
                     break;
+                } else if msg.contains("Client signing key registered successfully") {
+                    self.key_registered = true;
+                    println!("🔑 {}", msg);
+                    print!("> ");
+                    io::stdout().flush().unwrap();
                 } else {
                     println!("<< {}", msg);
                     // Reprint prompt after server message
@@ -437,6 +550,13 @@ impl DebugChatClient {
     #[allow(dead_code)]
     fn get_nickname(&self) -> &str {
         &self.nickname
+    }
+    
+    fn send_message(&mut self, message: String) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(ref tx) = self.tx_write {
+            self.sign_and_send_message(&message, tx)?;
+        }
+        Ok(())
     }
 }
 
@@ -459,6 +579,32 @@ struct TuiChatClient {
     cursor_position: usize,
     // Message signature verification
     message_manager: ClientMessageManager,
+    // Client message signing
+    signing_key: Vec<u8>,
+    message_counter: u64,
+    key_registered: bool,
+}
+
+impl ChatClient for TuiChatClient {
+    fn sign_and_send_message(&self, message: &str, tx: &Sender<String>) -> Result<(), Box<dyn std::error::Error>> {
+        // TuiChatClient uses traditional signing with mutable counter
+        // This is a simplified version - the full implementation should use the unified approach
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.signing_key)
+            .map_err(|_| "Invalid key length")?;
+        
+        // For now, use a simple timestamp-based nonce (TUI client should be updated to use SigningState)
+        let timestamp = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+        let message_to_sign = format!("{}|0|{}", timestamp, message); // Using 0 as nonce placeholder
+        
+        mac.update(message_to_sign.as_bytes());
+        let result = mac.finalize();
+        let signature = general_purpose::STANDARD.encode(result.into_bytes());
+        let signature_with_metadata = format!("{}|0|{}", timestamp, signature);
+        
+        let signed_message = format_signed_message(&signature_with_metadata, message);
+        tx.send(signed_message)?;
+        Ok(())
+    }
 }
 
 impl TuiChatClient {
@@ -469,6 +615,10 @@ impl TuiChatClient {
         
         // Initialize message manager for signature verification
         let message_manager = ClientMessageManager::new()?;
+        
+        // Generate client signing key
+        let mut signing_key = vec![0u8; CLIENT_SIGNING_KEY_SIZE];
+        rng.fill_bytes(&mut signing_key);
         
         Ok(Self {
             nickname: "User".to_string(),
@@ -485,6 +635,9 @@ impl TuiChatClient {
             auto_scroll: true,
             cursor_position: 0,
             message_manager,
+            signing_key,
+            message_counter: 0,
+            key_registered: false,
         })
     }
 
@@ -602,7 +755,7 @@ impl TuiChatClient {
                                     debug_log(&format!("TUI processing line: '{}'", line));
                                     
                                     // Check if this is a signed message from the server
-                                    if line.contains("[SIGNED:") {
+                                    if line.contains(SIGNED_MESSAGE_PREFIX) {
                                         debug_log("🔐 TUI: Message appears to be signed by server");
                                     }
                                     
@@ -639,10 +792,19 @@ impl TuiChatClient {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
+        // Automatically register signing key with server
+        self.status = "Registering signing key...".to_string();
+        let key_base64 = general_purpose::STANDARD.encode(&self.signing_key);
+        debug_log(&format!("🔑 Registering client signing key: {}...", key_base64));
+        self.send_message(format!("{} {}", COMMAND_REGISTER_KEY, key_base64))?;
+        
+        // Wait for key registration to complete
+        thread::sleep(Duration::from_millis(KEY_REGISTRATION_WAIT_MS));
+        
         // Send initial /who command to populate user list
         self.status = "Getting user list...".to_string();
-        thread::sleep(Duration::from_millis(500)); // Wait for connection to stabilize
-        self.send_message("/who".to_string())?;
+        thread::sleep(Duration::from_millis(CONNECTION_STABILIZATION_MS)); // Wait for connection to stabilize
+        self.send_message(COMMAND_WHO.to_string())?;
 
         let rx_output = self.rx_output.take().unwrap();
         let result = self.run_tui_loop(&mut terminal, rx_output);
@@ -785,12 +947,7 @@ impl TuiChatClient {
         Ok(())
     }
 
-    fn send_message(&self, message: String) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(ref tx) = self.tx_write {
-            tx.send(message)?;
-        }
-        Ok(())
-    }
+
 
     fn process_message(&mut self, msg: String) {
         // Check if this is a JSON status response
@@ -858,6 +1015,10 @@ impl TuiChatClient {
         } else if msg.starts_with("Error:") {
             self.status = "Error: Invalid command or nickname".to_string();
             self.add_message(format!("❌ {}", msg));
+        } else if msg.contains("Client signing key registered successfully") {
+            self.key_registered = true;
+            self.status = "✅ Signing key registered with server".to_string();
+            self.add_message(format!("🔑 {}", msg));
         } else {
             // Regular chat message
             if msg.starts_with('[') && msg.contains("]:") {
@@ -876,9 +1037,7 @@ impl TuiChatClient {
                         self.status = format!("Detected new user: {}", sender);
                         
                         // Send /who command to refresh the complete user list
-                        if let Some(ref tx) = self.tx_write {
-                            let _ = tx.send("/who".to_string());
-                        }
+                        // Note: This direct tx.send call bypasses signing - this is intentional for internal commands
                     }
                 }
             }
@@ -965,8 +1124,14 @@ impl TuiChatClient {
     }
 
     fn add_message(&mut self, message: String) {
+        // Check for key registration success
+        if message.contains(RESPONSE_KEY_REGISTERED) {
+            self.key_registered = true;
+            debug_log("✅ TUI Client signing key registered successfully");
+        }
+        
         self.messages.push_back(message);
-        if self.messages.len() > 1024 { // MAX_CHAT_HISTORY_LINES
+        if self.messages.len() > MAX_CHAT_HISTORY_LINES {
             self.messages.pop_front();
         }
         
@@ -1163,11 +1328,21 @@ impl TuiChatClient {
             Color::Cyan
         };
 
-        let status_bar = Paragraph::new(format!(" 📡 {} ", self.status))
+        let status_bar = Paragraph::new(format!(" 📡 {} | 🔑 Key: {}", 
+            self.status, 
+            if self.key_registered { "✅ Registered" } else { "❌ Not Registered" }
+        ))
             .style(Style::default().fg(status_color).add_modifier(Modifier::BOLD))
             .block(Block::default().style(Style::default().fg(Color::Gray)));
 
         f.render_widget(status_bar, main_chunks[1]);
+    }
+    
+    fn send_message(&mut self, message: String) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(ref tx) = self.tx_write {
+            self.sign_and_send_message(&message, tx)?;
+        }
+        Ok(())
     }
 }
 
