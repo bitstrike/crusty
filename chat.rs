@@ -108,6 +108,23 @@ impl MessageManager {
 
     fn broadcast_control_message(&self, message_type: &str, nickname: &str, additional_info: Option<&str>, users: &SharedUsers, sender_id: usize) -> Result<(), Box<dyn std::error::Error>> {
         let signed_message = self.generate_control_message(message_type, nickname, additional_info)?;
+        
+        // TODO: FUTURE ENHANCEMENT - Implement broadcast_signed_control_message for consistency
+        // 
+        // SECURITY ANALYSIS:
+        // Current: Control message content is signed, but delivery uses unsigned broadcast_message()
+        // TLS already provides: confidentiality, integrity, and server authentication
+        // Message signing adds: application-level authenticity, non-repudiation, defense in depth
+        //
+        // Why this matters even with TLS:
+        // 1. Defense in depth: Multiple security layers (TLS + signing)
+        // 2. Application security: Protects against server compromise, code injection, insider threats
+        // 3. Non-repudiation: Proves message origin even if TLS is compromised
+        // 4. Consistency: All other message types use signed delivery
+        //
+        // Implementation: Replace broadcast_message() with signed delivery method
+        // similar to broadcast_signed_chat_message() for unified security model
+        
         broadcast_message(&signed_message, sender_id, users);
         Ok(())
     }
