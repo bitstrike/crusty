@@ -233,6 +233,7 @@ struct DebugChatClient {
     rx_output: Option<Receiver<String>>,
     key_manager: UnifiedKeyManager,
     key_registered: bool,
+    allow_self_signed: bool,
 }
 
 impl ChatClient for DebugChatClient {
@@ -252,10 +253,12 @@ impl DebugChatClient {
             rx_output: None,
             key_manager: UnifiedKeyManager::new()?,
             key_registered: false,
+            allow_self_signed: false,
         })
     }
 
     fn connect(&mut self, host: &str, port: u16, allow_self_signed: bool) -> Result<(), Box<dyn std::error::Error>> {
+        self.allow_self_signed = allow_self_signed;
         debug_log(&format!("Connecting to {}:{}", host, port));
         
         let config = ClientConfig::builder()
@@ -302,6 +305,8 @@ impl DebugChatClient {
         
         println!("=== Debug Chat Client ===");
         println!("Cert file: {}", CERT_PATH);
+        let cert_indicator = if self.allow_self_signed { "⚠️ SS cert" } else { "🔒 Cert" };
+        println!("Certificate: {}", cert_indicator);
         println!("Commands: /nick <name>, /who, /quit");
         println!("===========================");
 
@@ -403,6 +408,7 @@ struct TuiChatClient {
     cursor_position: usize,
     key_manager: UnifiedKeyManager,
     key_registered: bool,
+    allow_self_signed: bool,
 }
 
 impl ChatClient for TuiChatClient {
@@ -436,10 +442,12 @@ impl TuiChatClient {
             cursor_position: 0,
             key_manager: UnifiedKeyManager::new()?,
             key_registered: false,
+            allow_self_signed: false,
         })
     }
 
     fn connect(&mut self, host: &str, port: u16, allow_self_signed: bool) -> Result<(), Box<dyn std::error::Error>> {
+        self.allow_self_signed = allow_self_signed;
         self.status = format!("Connecting to {}:{}...", host, port);
         debug_log(&format!("TUI client connecting to {}:{}", host, port));
         
@@ -651,10 +659,17 @@ impl TuiChatClient {
         f.render_widget(input_paragraph, main_chunks[1]);
 
         // Status
-        let status_bar = Paragraph::new(format!(" {} | Key: {} | Cert: {}", 
+        let cert_indicator = if self.allow_self_signed {
+            "⚠️ SS cert"
+        } else {
+            "🔒 Cert"
+        };
+        
+        let status_bar = Paragraph::new(format!(" {} | Key: {} | Cert: {} | {}", 
             self.status,
             if self.key_registered { "✅" } else { "❌" },
-            CERT_PATH
+            CERT_PATH,
+            cert_indicator
         ))
         .style(Style::default().fg(Color::Cyan));
 

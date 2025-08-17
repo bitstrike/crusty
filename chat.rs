@@ -186,6 +186,23 @@ impl MessageManager {
         }
         Ok(())
     }
+
+    fn broadcast_signed_chat_message(&self, message: &str, sender_id: usize, users: &SharedUsers) -> Result<(), Box<dyn std::error::Error>> {
+        let signed_message = self.sign_message(message)?;
+        let formatted_message = format_signed_message(&signed_message, message);
+        
+        debug_log(&format!("Broadcasting signed chat message: {} (excluding sender {})", formatted_message, sender_id));
+        let users_lock = users.lock().unwrap();
+        for (&user_id, user) in users_lock.iter() {
+            if user_id != sender_id {
+                match user.message_sender.send(formatted_message.clone()) {
+                    Ok(()) => debug_log(&format!("Sent signed chat message to user {}: {}", user_id, message)),
+                    Err(e) => debug_log(&format!("Failed to send signed chat message to user {}: {}", user_id, e)),
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 
@@ -297,7 +314,7 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
         });
     }
 
-    // Send welcome messages
+    // Send initial welcome messages (unsigned for bootstrap)
     let _ = writeln!(tls_stream, "Welcome! Commands: {} <n>, {}, {} <key>, {}", COMMAND_NICK, COMMAND_WHO, COMMAND_REGISTER_KEY, COMMAND_SIGNING_STATUS);
     let _ = writeln!(tls_stream, "You are {}.", initial_nickname);
     let _ = tls_stream.flush();
@@ -357,9 +374,9 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
                                     }
                                     Err(e) => {
                                         debug_log(&format!("❌ Message verification failed for user {}: {}", user_id, e));
-                                        // Send error response and continue
-                                        if let Some(user) = users.lock().unwrap().get(&user_id) {
-                                            let _ = user.message_sender.send(format!("Error: {}", RESPONSE_VERIFICATION_FAILED));
+                                        // Send signed error response and continue
+                                        if let Err(e) = message_manager.send_signed_response(&format!("Error: {}", RESPONSE_VERIFICATION_FAILED), user_id, &users) {
+                                            debug_log(&format!("Failed to send signed verification error: {}", e));
                                         }
                                         continue;
                                     }
@@ -412,9 +429,9 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
                                     }
                                     None => {
                                         println!("Invalid nickname from {}: {}", initial_nickname, new_nick);
-                                        // Send error back to client via channel
-                                        if let Some(user) = users.lock().unwrap().get(&user_id) {
-                                            let _ = user.message_sender.send(format!("Error: Invalid nickname '{}'. Use 1-16 alphanumeric characters only.", new_nick));
+                                        // Send signed error response back to client
+                                        if let Err(e) = message_manager.send_signed_response(&format!("Error: Invalid nickname '{}'. Use 1-16 alphanumeric characters only.", new_nick), user_id, &users) {
+                                            debug_log(&format!("Failed to send signed nickname error: {}", e));
                                         }
                                     }
                                 }
@@ -461,10 +478,15 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
                                     if let Err(e) = message_manager.send_signed_response(RESPONSE_KEY_REGISTERED, user_id, &users) {
                                         debug_log(&format!("Failed to send signed response: {}", e));
                                     }
+                                    // Send signed welcome message now that key is registered
+                                    let signed_welcome = format!("🔐 Secure connection established! All messages are now signed and verified.");
+                                    if let Err(e) = message_manager.send_signed_response(&signed_welcome, user_id, &users) {
+                                        debug_log(&format!("Failed to send signed welcome: {}", e));
+                                    }
                                 } else {
-                                    // Send error response
-                                    if let Some(user) = users.lock().unwrap().get(&user_id) {
-                                        let _ = user.message_sender.send("Error: Invalid key format. Use base64 encoding.".to_string());
+                                    // Send signed error response
+                                    if let Err(e) = message_manager.send_signed_response("Error: Invalid key format. Use base64 encoding.", user_id, &users) {
+                                        debug_log(&format!("Failed to send signed key format error: {}", e));
                                     }
                                 }
                             } else if sanitized == "/signing_status" {
@@ -511,7 +533,9 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
 
                                 // Broadcast this message to all connected clients (excluding sender)
                                 let message = format!("[{}]: {}", nickname, sanitized);
-                                broadcast_message(&message, user_id, &users);
+                                if let Err(e) = message_manager.broadcast_signed_chat_message(&message, user_id, &users) {
+                                    debug_log(&format!("Failed to broadcast signed chat message: {}", e));
+                                }
 
                                 // Also echo back to sender with signed confirmation
                                 if let Err(e) = message_manager.send_signed_response(&message, user_id, &users) {
