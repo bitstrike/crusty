@@ -4,15 +4,15 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, Duration};
-use std::fs;
+
 use rustls::{ClientConfig, ClientConnection, StreamOwned, Certificate, ServerName};
 use rustls::client::{ServerCertVerifier, ServerCertVerified};
 use serde::{Serialize, Deserialize};
 use rand::{Rng, RngCore};
 use hmac::{Hmac, Mac};
-use sha2::{Sha256, Digest};
+use sha2::Sha256;
 use base64::{Engine as _, engine::general_purpose};
-use pbkdf2::pbkdf2_hmac;
+use pbkdf2::pbkdf2_hmac_array;
 mod config;
 use config::*;
 
@@ -41,7 +41,7 @@ impl ServerCertVerifier for ConfigurableCertVerifier {
     ) -> Result<ServerCertVerified, rustls::Error> {
         if self.allow_self_signed {
             debug_log("Accepting self-signed certificate (--allow-self-signed enabled)");
-            Ok(ServerCertVerified::assertion())
+        Ok(ServerCertVerified::assertion())
         } else {
             // Use default WebPKI verification for production
             Err(rustls::Error::General("Certificate verification not implemented for production use".into()))
@@ -49,11 +49,10 @@ impl ServerCertVerifier for ConfigurableCertVerifier {
     }
 }
 
-// Unified key manager with proper derivation
+// Unified key manager for client message signing only
 #[derive(Clone)]
 struct UnifiedKeyManager {
     signing_key: Vec<u8>,
-    server_verification_key: Vec<u8>,
     message_counter: Arc<Mutex<u64>>,
 }
 
@@ -63,24 +62,14 @@ impl UnifiedKeyManager {
         let mut base_key = vec![0u8; 32];
         rand::thread_rng().fill_bytes(&mut base_key);
         
-        // Use PBKDF2 for key strengthening
+        // Use PBKDF2 for key strengthening (client-side only)
         let salt = b"chat_client_signing_salt_2024";
-        let mut signing_key = vec![0u8; CLIENT_SIGNING_KEY_SIZE];
-        pbkdf2_hmac::<Sha256>(&base_key, salt, 100_000, &mut signing_key);
+        let signing_key: [u8; 32] = pbkdf2_hmac_array::<Sha256, 32>(&base_key, salt, 100_000);
         
-        // Derive server verification key from KEY_PATH constant
-        let key_data = fs::read_to_string(KEY_PATH)
-            .map_err(|e| format!("Failed to read key file '{}': {}", KEY_PATH, e))?;
-        
-        let server_salt = b"chat_server_verify_salt_2024";
-        let mut server_verification_key = vec![0u8; 32];
-        pbkdf2_hmac::<Sha256>(key_data.as_bytes(), server_salt, 100_000, &mut server_verification_key);
-        
-        debug_log(&format!("Keys derived from {}", KEY_PATH));
+        debug_log("Client signing key generated with PBKDF2");
         
         Ok(Self {
-            signing_key,
-            server_verification_key,
+            signing_key: signing_key.to_vec(),
             message_counter: Arc::new(Mutex::new(0)),
         })
     }
@@ -112,31 +101,6 @@ impl UnifiedKeyManager {
     fn get_signing_key_b64(&self) -> String {
         general_purpose::STANDARD.encode(&self.signing_key)
     }
-    
-    fn verify_server_message(&self, signed_message: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
-        let signature_base64 = extract_signature(signed_message)
-            .ok_or("Could not extract signature")?;
-        
-        let message_content = extract_signed_content(signed_message)
-            .ok_or("Could not extract message content")?;
-        
-        let signature_bytes = general_purpose::STANDARD.decode(signature_base64)?;
-        
-        let mut mac = Hmac::<Sha256>::new_from_slice(&self.server_verification_key)
-            .map_err(|_| "Invalid server verification key length")?;
-        mac.update(message_content.as_bytes());
-        
-        match mac.verify_slice(&signature_bytes) {
-            Ok(()) => {
-                debug_log(&format!("✅ Server message verified: {}", message_content));
-                Ok(Some(message_content))
-            }
-            Err(_) => {
-                debug_log(&format!("❌ Server message verification failed: {}", message_content));
-                Err("Invalid server message signature".into())
-            }
-        }
-    }
 }
 
 // Unified stream handler for both client types
@@ -147,7 +111,7 @@ impl UnifiedStreamHandler {
         mut stream: TlsStream,
         rx_write: Receiver<String>,
         tx_output: Sender<String>,
-        client_type: &str,
+        client_type: String,
     ) {
         thread::spawn(move || {
             debug_log(&format!("{} stream handler started", client_type));
@@ -168,7 +132,7 @@ impl UnifiedStreamHandler {
                 }
                 
                 // Process incoming messages
-                if let Err(e) = Self::read_messages(&mut stream, &mut read_buffer, &tx_output, client_type) {
+                if let Err(e) = Self::read_messages(&mut stream, &mut read_buffer, &tx_output, &client_type) {
                     if e.kind() != std::io::ErrorKind::WouldBlock {
                         debug_log(&format!("{} read error: {}", client_type, e));
                         let _ = tx_output.send("DISCONNECT".to_string());
@@ -185,27 +149,27 @@ impl UnifiedStreamHandler {
     }
     
     fn write_with_retry(stream: &mut TlsStream, msg: &str) -> std::io::Result<()> {
-        let mut retry_count = 0;
+                    let mut retry_count = 0;
         const MAX_RETRIES: usize = 10;
-        
+                    
         while retry_count < MAX_RETRIES {
-            match write!(stream, "{}\r\n", msg) {
-                Ok(()) => {
-                    match stream.flush() {
-                        Ok(()) => {
-                            debug_log(&format!("Sent: {}", msg));
+                        match write!(stream, "{}\r\n", msg) {
+                            Ok(()) => {
+                                match stream.flush() {
+                                    Ok(()) => {
+                                        debug_log(&format!("Sent: {}", msg));
                             return Ok(());
-                        }
+                                    }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(5));
-                            retry_count += 1;
-                        }
+                                            thread::sleep(Duration::from_millis(5));
+                                            retry_count += 1;
+                                        }
                         Err(e) => return Err(e),
-                    }
-                }
+                                    }
+                                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5));
-                    retry_count += 1;
+                                    thread::sleep(Duration::from_millis(5));
+                                    retry_count += 1;
                 }
                 Err(e) => return Err(e),
             }
@@ -221,26 +185,26 @@ impl UnifiedStreamHandler {
         stream: &mut TlsStream,
         read_buffer: &mut String,
         tx_output: &Sender<String>,
-        client_type: &str,
+        client_type: &String,
     ) -> std::io::Result<()> {
-        let mut temp_buf = [0u8; 1024];
-        match stream.read(&mut temp_buf) {
-            Ok(0) => {
+                let mut temp_buf = [0u8; 1024];
+                match stream.read(&mut temp_buf) {
+                    Ok(0) => {
                 debug_log(&format!("{} server closed connection", client_type));
-                let _ = tx_output.send("DISCONNECT".to_string());
+                        let _ = tx_output.send("DISCONNECT".to_string());
                 Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "Server closed"))
-            }
-            Ok(n) => {
-                if let Ok(data) = std::str::from_utf8(&temp_buf[..n]) {
-                    read_buffer.push_str(data);
-                    
-                    while let Some(newline_pos) = read_buffer.find('\n') {
-                        let line = read_buffer[..newline_pos].trim().to_string();
+                    }
+                    Ok(n) => {
+                        if let Ok(data) = std::str::from_utf8(&temp_buf[..n]) {
+                            read_buffer.push_str(data);
+                            
+                            while let Some(newline_pos) = read_buffer.find('\n') {
+                                let line = read_buffer[..newline_pos].trim().to_string();
                         *read_buffer = read_buffer[newline_pos + 1..].to_string();
-                        
-                        if !line.is_empty() {
+                                
+                                if !line.is_empty() {
                             debug_log(&format!("{} received: {}", client_type, line));
-                            if tx_output.send(line).is_err() {
+                                    if tx_output.send(line).is_err() {
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::BrokenPipe, 
                                     "Output channel disconnected"
@@ -328,7 +292,7 @@ impl DebugChatClient {
         thread::sleep(Duration::from_millis(KEY_REGISTRATION_WAIT_MS));
 
         // Use unified stream handler
-        UnifiedStreamHandler::handle_stream(tls_stream, rx_write, tx_output, "DEBUG");
+        UnifiedStreamHandler::handle_stream(tls_stream, rx_write, tx_output, "DEBUG".to_string());
 
         Ok(())
     }
@@ -337,7 +301,6 @@ impl DebugChatClient {
         let rx_output = self.rx_output.take().unwrap();
         
         println!("=== Debug Chat Client ===");
-        println!("Key file: {}", KEY_PATH);
         println!("Cert file: {}", CERT_PATH);
         println!("Commands: /nick <name>, /who, /quit");
         println!("===========================");
@@ -372,10 +335,10 @@ impl DebugChatClient {
                                 };
                                 
                                 if tx.send(message_to_send).is_err() || msg == "/quit" {
-                                    running_clone.store(false, std::sync::atomic::Ordering::Relaxed);
-                                    break;
+                                        running_clone.store(false, std::sync::atomic::Ordering::Relaxed);
+                                        break;
+                                    }
                                 }
-                            }
                         }
                     }
                     Err(e) => {
@@ -417,7 +380,7 @@ use crossterm::{
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
@@ -506,7 +469,7 @@ impl TuiChatClient {
         self.rx_output = Some(rx_output);
 
         // Use unified stream handler
-        UnifiedStreamHandler::handle_stream(tls_stream, rx_write, tx_output, "TUI");
+        UnifiedStreamHandler::handle_stream(tls_stream, rx_write, tx_output, "TUI".to_string());
         Ok(())
     }
 
@@ -633,12 +596,15 @@ impl TuiChatClient {
     }
 
     fn process_message(&mut self, msg: String) {
-        // Handle key registration success
+        // Handle key registration success - only update status, don't show in chat
         if msg.contains(RESPONSE_KEY_REGISTERED) {
             self.key_registered = true;
             self.status = "✅ Signing key registered with server".to_string();
+            debug_log("🔑 Client signing key registered successfully");
+            return; // Don't add to chat history
         }
         
+        // Add normal messages to chat history
         self.messages.push_back(msg);
         if self.messages.len() > MAX_CHAT_HISTORY_LINES {
             self.messages.pop_front();
@@ -685,10 +651,9 @@ impl TuiChatClient {
         f.render_widget(input_paragraph, main_chunks[1]);
 
         // Status
-        let status_bar = Paragraph::new(format!(" {} | Key: {} | Files: {} {}", 
+        let status_bar = Paragraph::new(format!(" {} | Key: {} | Cert: {}", 
             self.status,
             if self.key_registered { "✅" } else { "❌" },
-            KEY_PATH,
             CERT_PATH
         ))
         .style(Style::default().fg(Color::Cyan));
@@ -704,7 +669,7 @@ impl TuiChatClient {
     }
 }
 
-// Updated argument parsing with self-signed certificate option
+// Fixed argument parsing with --server support
 struct Args {
     host: String,
     port: u16,
@@ -725,7 +690,7 @@ impl Args {
         let mut i = 1;
         while i < args.len() {
             match args[i].as_str() {
-                "--host" => {
+                "--host" | "--server" => {  // Accept both --host and --server
                     if i + 1 < args.len() {
                         host = args[i + 1].clone();
                         i += 1;
@@ -747,13 +712,13 @@ impl Args {
                     println!("Usage: {} [OPTIONS]", args[0]);
                     println!("Options:");
                     println!("  --host HOST              Server hostname (default: localhost)");
+                    println!("  --server HOST            Server hostname (alias for --host)");
                     println!("  --port PORT              Server port (default: 8443)");
                     println!("  --debug                  Enable debug output");
                     println!("  --tui                    Use terminal UI mode");
                     println!("  --allow-self-signed      Accept self-signed certificates");
                     println!("  --help                   Show this help");
-                    println!("\nKey file: {}", KEY_PATH);
-                    println!("Cert file: {}", CERT_PATH);
+                    println!("\nCert file: {}", CERT_PATH);
                     std::process::exit(0);
                 }
                 _ => {}
@@ -796,13 +761,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.debug {
         DEBUG.store(true, std::sync::atomic::Ordering::Relaxed);
         debug_log("Debug mode enabled");
-        debug_log(&format!("Using key file: {}", KEY_PATH));
         debug_log(&format!("Using cert file: {}", CERT_PATH));
     }
 
     if args.tui {
         println!("Starting TUI Chat Client...");
-        println!("Key file: {}", KEY_PATH);
         println!("Cert file: {}", CERT_PATH);
         if args.allow_self_signed {
             println!("⚠️  Self-signed certificates allowed");
@@ -810,7 +773,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Connecting to {}:{}...", args.host, args.port);
         
         let mut tui_client = TuiChatClient::new().map_err(|e| {
-            format!("Failed to initialize TUI client: {}. Check that '{}' exists.", e, KEY_PATH)
+            format!("Failed to initialize TUI client: {}.", e)
         })?;
         
         match tui_client.connect(&args.host, args.port, args.allow_self_signed) {
@@ -827,7 +790,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         println!("=== Debug Chat Client ===");
-        println!("Key file: {}", KEY_PATH);
         println!("Cert file: {}", CERT_PATH);
         if args.allow_self_signed {
             println!("⚠️  Self-signed certificates allowed");
@@ -835,7 +797,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Connecting to {}:{}...", args.host, args.port);
 
         let mut client = DebugChatClient::new().map_err(|e| {
-            format!("Failed to initialize debug client: {}. Check that '{}' exists.", e, KEY_PATH)
+            format!("Failed to initialize debug client: {}.", e)
         })?;
         
         match client.connect(&args.host, args.port, args.allow_self_signed) {
