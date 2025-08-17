@@ -618,12 +618,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create MessageManager for handling signed messages
-    let message_manager = MessageManager::new("key.pem", "cert.pem")?;
+    let message_manager = MessageManager::new(KEY_PATH, CERT_PATH)?;
     
     // Use the same certs and key for TLS configuration
     let certs = message_manager.public_cert.clone();
     // Load the key file for TLS configuration using the proper loader
-    let key = load_private_key("key.pem")?;
+    let key = load_private_key(KEY_PATH)?;
 
     let config = ServerConfig::builder()
         .with_safe_defaults()

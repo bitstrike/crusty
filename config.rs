@@ -69,6 +69,10 @@ pub fn is_signed_message(message: &str) -> bool {
     message.starts_with(SIGNED_MESSAGE_PREFIX) && message.contains(SIGNED_MESSAGE_SEPARATOR)
 }
 
+// cert and key paths
+pub const CERT_PATH: &str = "cert.pem";
+pub const KEY_PATH: &str = "key.pem";
+
 // Server configuration
 pub const MAX_USERS: usize = 5;
 pub const MAX_LAST_SEEN_SECONDS: u64 = 60; // Increased from 10 to 60 seconds
