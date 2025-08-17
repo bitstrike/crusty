@@ -64,28 +64,28 @@ impl MessageManager {
         let mut hasher = Sha256::new();
         hasher.update(key_data.as_bytes());
         let secret_key = hasher.finalize().to_vec();
-        
+
         let public_cert = load_certs(cert_path)?;
-        
+
         Ok(MessageManager {
             private_key: secret_key,
             public_cert,
             client_keys: Arc::new(Mutex::new(HashMap::new())),
         })
     }
-    
+
     fn sign_message(&self, message: &str) -> Result<String, Box<dyn std::error::Error>> {
         // Create HMAC-SHA256 signature
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.private_key)
             .map_err(|_| "Invalid key length")?;
-        
+
         mac.update(message.as_bytes());
         let result = mac.finalize();
-        
+
         // Encode the signature as base64 for transmission
         Ok(general_purpose::STANDARD.encode(result.into_bytes()))
     }
-    
+
     fn generate_control_message(&self, message_type: &str, nickname: &str, additional_info: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
         let base_message = match message_type {
             "nickname_change" => {
@@ -100,59 +100,59 @@ impl MessageManager {
             "user_timeout" => format_timeout_message(nickname),
             _ => format_control_message(message_type)
         };
-        
+
         // Generate HMAC signature for server authentication
         let signature = self.sign_message(&base_message)?;
         Ok(format_signed_message(&signature, &base_message))
     }
-    
+
     fn broadcast_control_message(&self, message_type: &str, nickname: &str, additional_info: Option<&str>, users: &SharedUsers, sender_id: usize) -> Result<(), Box<dyn std::error::Error>> {
         let signed_message = self.generate_control_message(message_type, nickname, additional_info)?;
         broadcast_message(&signed_message, sender_id, users);
         Ok(())
     }
-    
+
     fn verify_client_message(&self, signed_message: &str, user_id: usize) -> Result<Option<String>, Box<dyn std::error::Error>> {
         // Check if this is a signed message
         if !is_signed_message(signed_message) {
             return Ok(None); // Not a signed message, treat as regular message
         }
-        
+
         // Extract signature metadata and actual message content
         let signature_metadata = extract_signature(signed_message)
             .ok_or("Could not extract signature")?;
-        
+
         let actual_message = extract_signed_content(signed_message)
             .ok_or("Could not extract message content")?;
-        
+
         // Get client's signing key
         let client_key = {
             let keys_lock = self.client_keys.lock().unwrap();
             keys_lock.get(&user_id).cloned()
         };
-        
+
         if let Some(client_key) = client_key {
             // Parse signature metadata: "timestamp|nonce|signature"
             let parts: Vec<&str> = signature_metadata.splitn(3, '|').collect();
             if parts.len() != 3 {
                 return Err("Invalid signature format: expected timestamp|nonce|signature".into());
             }
-            
+
             let timestamp = parts[0];
             let nonce = parts[1];
             let signature_base64 = parts[2];
-            
+
             // Decode the base64 signature
             let signature_bytes = general_purpose::STANDARD.decode(signature_base64)?;
-            
+
             // Reconstruct the exact string that was signed by client
             let message_to_verify = format!("{}|{}|{}", timestamp, nonce, actual_message);
-            
+
             // Verify HMAC-SHA256 signature
             let mut mac = Hmac::<Sha256>::new_from_slice(&client_key)
                 .map_err(|_| "Invalid key length")?;
             mac.update(message_to_verify.as_bytes());
-            
+
             let result = mac.verify_slice(&signature_bytes);
             match result {
                 Ok(()) => {
@@ -170,17 +170,17 @@ impl MessageManager {
             Ok(Some(actual_message))
         }
     }
-    
+
     fn register_client_key(&self, user_id: usize, client_key: Vec<u8>) {
         let mut keys_lock = self.client_keys.lock().unwrap();
         keys_lock.insert(user_id, client_key);
         debug_log(&format!("🔑 Registered client signing key for user {}", user_id));
     }
-    
+
     fn send_signed_response(&self, message: &str, user_id: usize, users: &SharedUsers) -> Result<(), Box<dyn std::error::Error>> {
         let signed_message = self.sign_message(message)?;
         let formatted_message = format_signed_message(&signed_message, message);
-        
+
         if let Some(user) = users.lock().unwrap().get(&user_id) {
             let _ = user.message_sender.send(formatted_message);
         }
@@ -240,7 +240,7 @@ fn sanitize_message(input: &str) -> Option<String> {
     // Allow alphanumeric, spaces, basic punctuation, and base64 characters
     let re = Regex::new(r"^[a-zA-Z0-9\s/.,!?'_+=\-]+$").unwrap();
     let trimmed = input.trim();
-    
+
     // Special case: always allow /register_key commands with base64 keys
     if trimmed.starts_with("/register_key ") {
         let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
@@ -254,7 +254,7 @@ fn sanitize_message(input: &str) -> Option<String> {
         }
         return None;
     }
-    
+
     // Regular validation for other messages
     if trimmed.len() <= 256 && re.is_match(trimmed) && !trimmed.is_empty() {
         Some(trimmed.to_string())
@@ -274,16 +274,16 @@ fn sanitize_nickname(input: &str) -> Option<String> {
 
 fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, message_manager: Arc<MessageManager>) {
     let initial_nickname = format!("User{}", user_id);
-    
+
     // Set the underlying TCP stream to non-blocking mode for real-time message delivery
     if let Err(e) = tls_stream.get_mut().set_nonblocking(true) {
         debug_log(&format!("Failed to set non-blocking mode: {}", e));
         return;
     }
-    
+
     // Create channel for receiving messages to send to this client
     let (message_sender, message_receiver): (Sender<String>, Receiver<String>) = channel();
-    
+
     // Add user to collection
     {
         let mut users_lock = users.lock().unwrap();
@@ -303,7 +303,7 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
     let _ = tls_stream.flush();
 
     println!("{} {}", initial_nickname, MESSAGE_JOINED_CHAT);
-    
+
     // Broadcast join notification to all other users
     if let Err(e) = message_manager.broadcast_control_message("user_join", &initial_nickname, None, &users, user_id) {
         debug_log(&format!("Failed to broadcast join message: {}", e));
@@ -312,7 +312,7 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
     // Real-time message handling with non-blocking I/O (similar to client fix)
     let mut read_buffer = String::new();
     let mut temp_buf = [0u8; 1024];
-    
+
     loop {
         // Priority 1: Process ALL pending outgoing messages first (real-time delivery)
         let mut processed_outgoing = false;
@@ -324,7 +324,7 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
                 return;
             }
         }
-        
+
         // Priority 2: Check for incoming data (non-blocking)
         match tls_stream.read(&mut temp_buf) {
             Ok(0) => break, // Connection closed
@@ -332,12 +332,12 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
                 // Process received data
                 if let Ok(data) = std::str::from_utf8(&temp_buf[..n]) {
                     read_buffer.push_str(data);
-                    
+
                     // Process complete lines
                     while let Some(newline_pos) = read_buffer.find('\n') {
                         let input = read_buffer[..newline_pos].trim().to_string();
                         read_buffer = read_buffer[newline_pos + 1..].to_string();
-                        
+
                         if !input.is_empty() {
                             // Special handling for /register_key - allow unsigned
                             let (verified_message, _is_signed) = if input.starts_with(COMMAND_REGISTER_KEY) {
@@ -365,7 +365,7 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
                                     }
                                 }
                             };
-                            
+
                             // Process the verified message (existing logic)
                             let sanitized = match sanitize_message(&verified_message) {
                                 Some(msg) => msg,
@@ -393,17 +393,17 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
                                             }
                                         };
                                         debug_log(&format!("{} {} {}", old_nick, MESSAGE_NICKNAME_CHANGE, nick));
-                                        
+
                                         // Generate and broadcast control message to all clients
                                         if let Err(e) = message_manager.broadcast_control_message("nickname_change", &old_nick, Some(&nick), &users, user_id) {
                                             debug_log(&format!("Failed to broadcast nickname change message: {}", e));
                                         }
-                                        
+
                                         // Send signed confirmation back to client
                                         if let Err(e) = message_manager.send_signed_response(&format!("Your nickname is now: {}", nick), user_id, &users) {
                                             debug_log(&format!("Failed to send signed nickname confirmation: {}", e));
                                         }
-                                        
+
                                         // Reset nickname change flags after processing
                                         if let Some(user) = users.lock().unwrap().get_mut(&user_id) {
                                             user.nickname_changed = false;
@@ -444,10 +444,10 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
                                         user.last_seen = Instant::now();
                                     }
                                 }
-                                
+
                                 let status_json = generate_status_json(&users);
                                 debug_log(&format!("Status requested by user {}", user_id));
-                                
+
                                 // Send signed JSON status response
                                 if let Err(e) = message_manager.send_signed_response(&status_json, user_id, &users) {
                                     debug_log(&format!("Failed to send signed status response: {}", e));
@@ -473,27 +473,27 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
                                     let keys_lock = message_manager.client_keys.lock().unwrap();
                                     keys_lock.contains_key(&user_id)
                                 };
-                                
+
                                 let status_msg = if has_key {
                                     "✅ Client signing key is registered and active"
                                 } else {
                                     "⚠️  No client signing key registered. Use /register_key <key> to register."
                                 };
-                                
+
                                 if let Err(e) = message_manager.send_signed_response(status_msg, user_id, &users) {
                                     debug_log(&format!("Failed to send signed signing status: {}", e));
                                 }
                             } else if sanitized == COMMAND_QUIT {
                                 debug_log(&format!("User {} requested to quit", user_id));
-                                
+
                                 // Send signed confirmation to client
                                 if let Err(e) = message_manager.send_signed_response("Goodbye!", user_id, &users) {
                                     debug_log(&format!("Failed to send signed goodbye: {}", e));
                                 }
-                                
+
                                 // Small delay to ensure message is sent before breaking
                                 thread::sleep(Duration::from_millis(100));
-                                
+
                                 // Break from the client loop to trigger cleanup
                                 break;
                             } else {
@@ -508,11 +508,11 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
                                     }
                                 };
                                 debug_log(&format!("{}: {}", nickname, sanitized));
-                                
+
                                 // Broadcast this message to all connected clients (excluding sender)
                                 let message = format!("[{}]: {}", nickname, sanitized);
                                 broadcast_message(&message, user_id, &users);
-                                
+
                                 // Also echo back to sender with signed confirmation
                                 if let Err(e) = message_manager.send_signed_response(&message, user_id, &users) {
                                     debug_log(&format!("Failed to send signed message echo: {}", e));
@@ -531,7 +531,7 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
                 }
             }
         }
-        
+
         // Small sleep only if no work was done to prevent CPU spinning
         if !processed_outgoing {
             thread::sleep(Duration::from_millis(10));
@@ -543,9 +543,9 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
         let mut users_lock = users.lock().unwrap();
         users_lock.remove(&user_id).map(|u| u.nickname).unwrap_or_default()
     };
-    
+
     println!("{} {}", nickname, MESSAGE_LEFT_CHAT);
-    
+
     // Broadcast leave notification to all remaining users
     if let Err(e) = message_manager.broadcast_control_message("user_leave", &nickname, None, &users, user_id) {
         debug_log(&format!("Failed to broadcast leave message: {}", e));
@@ -557,13 +557,13 @@ fn generate_status_json(users: &SharedUsers) -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    
+
     let users_lock = users.lock().unwrap();
     let mut user_statuses = Vec::new();
-    
+
     for (&id, user) in users_lock.iter() {
         let last_seen_seconds = user.last_seen.elapsed().as_secs();
-        
+
         user_statuses.push(UserStatus {
             id,
             nickname: user.nickname.clone(),
@@ -573,13 +573,13 @@ fn generate_status_json(users: &SharedUsers) -> String {
             old_nickname: user.old_nickname.clone(),
         });
     }
-    
+
     let status_response = StatusResponse {
         timestamp: current_time,
         users: user_statuses.clone(),
         total_users: user_statuses.len(),
     };
-    
+
     serde_json::to_string(&status_response).unwrap_or_else(|_| "{}".to_string())
 }
 
@@ -595,12 +595,12 @@ fn cleanup_disconnected_users(users: &SharedUsers, message_manager: &MessageMana
             }
         }
     }
-    
+
     for (user_id, nickname) in users_to_remove {
         debug_log(&format!("Auto-removing inactive user: {} (id: {})", nickname, user_id));
         let mut users_lock = users.lock().unwrap();
         users_lock.remove(&user_id);
-        
+
         // Broadcast leave notification
         drop(users_lock); // Release lock before broadcasting
         if let Err(e) = message_manager.broadcast_control_message("user_timeout", &nickname, None, users, user_id) {
@@ -619,7 +619,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create MessageManager for handling signed messages
     let message_manager = MessageManager::new(KEY_PATH, CERT_PATH)?;
-    
+
     // Use the same certs and key for TLS configuration
     let certs = message_manager.public_cert.clone();
     // Load the key file for TLS configuration using the proper loader
