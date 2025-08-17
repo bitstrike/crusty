@@ -1,4 +1,4 @@
-// Shared configuration for TLS Chat system
+// config.rs - Shared configuration for TLS Chat system
 // This file contains constants and settings used by both client and server
 
 // Message formatting constants
