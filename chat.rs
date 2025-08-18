@@ -1,5 +1,6 @@
+// chat.rs - Fixed Server implementation for TLS Chat system
 use std::collections::HashMap;
-use std::io::{Write, Read};
+use std::io::{self, Write, Read};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{Sender, Receiver, channel};
@@ -11,6 +12,7 @@ use std::fs::{self, File};
 use std::io::BufReader as StdBufReader;
 use regex::Regex;
 use serde::{Serialize, Deserialize};
+use serde_json;
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Digest};
 use base64::{Engine as _, engine::general_purpose};
@@ -19,17 +21,7 @@ use config::*;
 
 type TlsStream = StreamOwned<ServerConnection, TcpStream>;
 
-// JSON Status Protocol Structures
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct UserStatus {
-    pub id: usize,
-    pub nickname: String,
-    pub state: String,
-    pub last_seen: u64,
-    pub nickname_changed: bool,
-    pub old_nickname: Option<String>, // Track old nickname for change notifications
-}
-
+// JSON Status Protocol Structures (now using config::UserStatus)
 #[derive(Serialize, Deserialize, Debug)]
 pub struct StatusResponse {
     pub timestamp: u64,
@@ -42,8 +34,6 @@ struct ChatUser {
     message_sender: Sender<String>,
     last_seen: Instant,
     state: String,
-    nickname_changed: bool,
-    old_nickname: Option<String>, // Track previous nickname
 }
 
 type SharedUsers = Arc<Mutex<HashMap<usize, ChatUser>>>;
@@ -51,13 +41,12 @@ type SharedUsers = Arc<Mutex<HashMap<usize, ChatUser>>>;
 // MessageManager handles all message signing, verification, and control message generation
 struct MessageManager {
     private_key: Vec<u8>, // HMAC secret key
-    public_cert: Vec<Certificate>,
     // Client verification tracking
     client_keys: Arc<Mutex<HashMap<usize, Vec<u8>>>>, // user_id -> client_signing_key
 }
 
 impl MessageManager {
-    fn new(key_path: &str, cert_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(key_path: &str, _cert_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         // For HMAC, we'll use a simple secret key derived from the key file
         let key_data = fs::read_to_string(key_path)?;
         // Use a hash of the key file content as HMAC secret to ensure proper length
@@ -65,11 +54,8 @@ impl MessageManager {
         hasher.update(key_data.as_bytes());
         let secret_key = hasher.finalize().to_vec();
 
-        let public_cert = load_certs(cert_path)?;
-
         Ok(MessageManager {
             private_key: secret_key,
-            public_cert,
             client_keys: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -84,49 +70,6 @@ impl MessageManager {
 
         // Encode the signature as base64 for transmission
         Ok(general_purpose::STANDARD.encode(result.into_bytes()))
-    }
-
-    fn generate_control_message(&self, message_type: &str, nickname: &str, additional_info: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
-        let base_message = match message_type {
-            "nickname_change" => {
-                if let Some(new_nick) = additional_info {
-                    format_nickname_change_message(nickname, new_nick)
-                } else {
-                    format_control_message(message_type)
-                }
-            },
-            "user_join" => format_join_message(nickname),
-            "user_leave" => format_leave_message(nickname),
-            "user_timeout" => format_timeout_message(nickname),
-            _ => format_control_message(message_type)
-        };
-
-        // Generate HMAC signature for server authentication
-        let signature = self.sign_message(&base_message)?;
-        Ok(format_signed_message(&signature, &base_message))
-    }
-
-    fn broadcast_control_message(&self, message_type: &str, nickname: &str, additional_info: Option<&str>, users: &SharedUsers, sender_id: usize) -> Result<(), Box<dyn std::error::Error>> {
-        let signed_message = self.generate_control_message(message_type, nickname, additional_info)?;
-        
-        // TODO: FUTURE ENHANCEMENT - Implement broadcast_signed_control_message for consistency
-        // 
-        // SECURITY ANALYSIS:
-        // Current: Control message content is signed, but delivery uses unsigned broadcast_message()
-        // TLS already provides: confidentiality, integrity, and server authentication
-        // Message signing adds: application-level authenticity, non-repudiation, defense in depth
-        //
-        // Why this matters even with TLS:
-        // 1. Defense in depth: Multiple security layers (TLS + signing)
-        // 2. Application security: Protects against server compromise, code injection, insider threats
-        // 3. Non-repudiation: Proves message origin even if TLS is compromised
-        // 4. Consistency: All other message types use signed delivery
-        //
-        // Implementation: Replace broadcast_message() with signed delivery method
-        // similar to broadcast_signed_chat_message() for unified security model
-        
-        broadcast_message(&signed_message, sender_id, users);
-        Ok(())
     }
 
     fn verify_client_message(&self, signed_message: &str, user_id: usize) -> Result<Option<String>, Box<dyn std::error::Error>> {
@@ -210,25 +153,131 @@ impl MessageManager {
         
         debug_log(&format!("Broadcasting signed chat message: {} (excluding sender {})", formatted_message, sender_id));
         let users_lock = users.lock().unwrap();
+        let mut failed_sends: Vec<(usize, String)> = Vec::new();
         for (&user_id, user) in users_lock.iter() {
             if user_id != sender_id {
                 match user.message_sender.send(formatted_message.clone()) {
                     Ok(()) => debug_log(&format!("Sent signed chat message to user {}: {}", user_id, message)),
-                    Err(e) => debug_log(&format!("Failed to send signed chat message to user {}: {}", user_id, e)),
+                    Err(e) => {
+                        debug_log(&format!("Failed to send signed chat message to user {}: {}", user_id, e));
+                        failed_sends.push((user_id, user.nickname.clone()));
+                    },
                 }
+            }
+        }
+        drop(users_lock);
+
+        for (failed_user_id, failed_nick) in failed_sends {
+            {
+                let mut users_lock = users.lock().unwrap();
+                users_lock.remove(&failed_user_id);
+            }
+
+            let leave_event = ServerEvent::UserLeave {
+                user_id: failed_user_id,
+                nickname: failed_nick.clone(),
+                reason: "disconnected".to_string(),
+                timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            };
+            let _ = self.broadcast_global_event(&leave_event, users);
+        }
+        Ok(())
+    }
+
+    // Event-driven broadcasting methods
+    fn broadcast_global_event(&self, event: &ServerEvent, users: &SharedUsers) -> Result<(), Box<dyn std::error::Error>> {
+        let event_json = serde_json::to_string(event)?;
+        let signed_event = self.sign_message(&event_json)?;
+        let formatted_event = format_signed_message(&signed_event, &event_json);
+        
+        debug_log(&format!("Broadcasting global event: {}", event_json));
+        let users_lock = users.lock().unwrap();
+        let mut failed_sends: Vec<(usize, String)> = Vec::new();
+        for (&user_id, user) in users_lock.iter() {
+            match user.message_sender.send(formatted_event.clone()) {
+                Ok(()) => debug_log(&format!("Sent global event to user {}: {}", user_id, event_json)),
+                Err(e) => {
+                    debug_log(&format!("Failed to send global event to user {}: {}", user_id, e));
+                    failed_sends.push((user_id, user.nickname.clone()));
+                },
+            }
+        }
+        drop(users_lock);
+
+        for (failed_user_id, failed_nick) in failed_sends {
+            {
+                let mut users_lock = users.lock().unwrap();
+                users_lock.remove(&failed_user_id);
+            }
+            let leave_event = ServerEvent::UserLeave {
+                user_id: failed_user_id,
+                nickname: failed_nick,
+                reason: "disconnected".to_string(),
+                timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            };
+            let _ = self.broadcast_global_event(&leave_event, users);
+        }
+        Ok(())
+    }
+
+    fn broadcast_global_event_excluding(&self, event: &ServerEvent, users: &SharedUsers, exclude_user_id: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let event_json = serde_json::to_string(event)?;
+        let signed_event = self.sign_message(&event_json)?;
+        let formatted_event = format_signed_message(&signed_event, &event_json);
+        
+        debug_log(&format!("Broadcasting global event (excluding {}): {}", exclude_user_id, event_json));
+        let users_lock = users.lock().unwrap();
+        let mut failed_sends: Vec<(usize, String)> = Vec::new();
+        for (&user_id, user) in users_lock.iter() {
+            if user_id != exclude_user_id {
+                match user.message_sender.send(formatted_event.clone()) {
+                    Ok(()) => debug_log(&format!("Sent global event to user {}: {}", user_id, event_json)),
+                    Err(e) => {
+                        debug_log(&format!("Failed to send global event to user {}: {}", user_id, e));
+                        failed_sends.push((user_id, user.nickname.clone()));
+                    },
+                }
+            }
+        }
+        drop(users_lock);
+
+        for (failed_user_id, failed_nick) in failed_sends {
+            {
+                let mut users_lock = users.lock().unwrap();
+                users_lock.remove(&failed_user_id);
+            }
+            let leave_event = ServerEvent::UserLeave {
+                user_id: failed_user_id,
+                nickname: failed_nick,
+                reason: "disconnected".to_string(),
+                timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            };
+            let _ = self.broadcast_global_event(&leave_event, users);
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn send_user_event(&self, event: &ServerEvent, user_id: usize, users: &SharedUsers) -> Result<(), Box<dyn std::error::Error>> {
+        let event_json = serde_json::to_string(event)?;
+        let signed_event = self.sign_message(&event_json)?;
+        let formatted_event = format_signed_message(&signed_event, &event_json);
+        
+        debug_log(&format!("Sending user event to {}: {}", user_id, event_json));
+        if let Some(user) = users.lock().unwrap().get(&user_id) {
+            match user.message_sender.send(formatted_event) {
+                Ok(()) => debug_log(&format!("Sent user event to user {}: {}", user_id, event_json)),
+                Err(e) => debug_log(&format!("Failed to send user event to user {}: {}", user_id, e)),
             }
         }
         Ok(())
     }
 }
 
-
-
 static DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn debug_log(msg: &str) {
     if DEBUG.load(std::sync::atomic::Ordering::Relaxed) {
-        use std::time::SystemTime;
         let now = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -237,19 +286,6 @@ fn debug_log(msg: &str) {
         let minutes = (now / 60) % 60;
         let seconds = now % 60;
         println!("[{:02}:{:02}:{:02}  DBG] {}", hours, minutes, seconds, msg);
-    }
-}
-
-fn broadcast_message(message: &str, sender_id: usize, users: &SharedUsers) {
-    debug_log(&format!("Broadcasting: {} (excluding sender {})", message, sender_id));
-    let users_lock = users.lock().unwrap();
-    for (&user_id, user) in users_lock.iter() {
-        if user_id != sender_id {
-            match user.message_sender.send(message.to_string()) {
-                Ok(()) => debug_log(&format!("Sent to user {}: {}", user_id, message)),
-                Err(e) => debug_log(&format!("Failed to send to user {}: {}", user_id, e)),
-            }
-        }
     }
 }
 
@@ -326,8 +362,6 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
             message_sender,
             last_seen: Instant::now(),
             state: "connected".to_string(),
-            nickname_changed: false,
-            old_nickname: None,
         });
     }
 
@@ -338,24 +372,27 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
 
     println!("{} {}", initial_nickname, MESSAGE_JOINED_CHAT);
 
-    // Broadcast join notification to all other users
-    if let Err(e) = message_manager.broadcast_control_message("user_join", &initial_nickname, None, &users, user_id) {
-        debug_log(&format!("Failed to broadcast join message: {}", e));
+    // Broadcast join notification to all other users using event-driven system
+    let join_event = ServerEvent::UserJoin {
+        user_id,
+        nickname: initial_nickname.clone(),
+        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+    };
+    if let Err(e) = message_manager.broadcast_global_event_excluding(&join_event, &users, user_id) {
+        debug_log(&format!("Failed to broadcast join event: {}", e));
     }
 
-    // Real-time message handling with non-blocking I/O (similar to client fix)
+    // Real-time message handling with non-blocking I/O
     let mut read_buffer = String::new();
     let mut temp_buf = [0u8; 1024];
 
     loop {
         // Priority 1: Process ALL pending outgoing messages first (real-time delivery)
-        let mut processed_outgoing = false;
         while let Ok(message) = message_receiver.try_recv() {
-            processed_outgoing = true;
             debug_log(&format!("Sent to user {}: {}", user_id, message));
             if let Err(_) = writeln!(tls_stream, "{}", message).and_then(|_| tls_stream.flush()) {
                 debug_log("Failed to write message to client, ending connection");
-                return;
+                break; // allow post-loop cleanup to run
             }
         }
 
@@ -374,20 +411,20 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
 
                         if !input.is_empty() {
                             // Special handling for /register_key - allow unsigned
-                            let (verified_message, _is_signed) = if input.starts_with(COMMAND_REGISTER_KEY) {
+                            let verified_message = if input.starts_with(COMMAND_REGISTER_KEY) {
                                 // /register_key commands are allowed unsigned for bootstrap
                                 debug_log(&format!("🔑 Processing unsigned /register_key command from user {}", user_id));
-                                (input.clone(), false)
+                                input.clone()
                             } else {
                                 // All other messages must be verified
                                 match message_manager.verify_client_message(&input, user_id) {
                                     Ok(Some(content)) => {
                                         debug_log(&format!("✅ Verified signed message from user {}: {}", user_id, content));
-                                        (content, true)
+                                        content
                                     }
                                     Ok(None) => {
                                         // Not a signed message, treat as regular message
-                                        (input.clone(), false)
+                                        input.clone()
                                     }
                                     Err(e) => {
                                         debug_log(&format!("❌ Message verification failed for user {}: {}", user_id, e));
@@ -400,11 +437,11 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
                                 }
                             };
 
-                            // Process the verified message (existing logic)
+                            // Process the verified message
                             let sanitized = match sanitize_message(&verified_message) {
                                 Some(msg) => msg,
                                 None => {
-                                    println!("Invalid message from {}: {}", initial_nickname, verified_message);
+                                    println!("Invalid message from user {}: {}", user_id, verified_message);
                                     continue;
                                 }
                             };
@@ -417,10 +454,8 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
                                             let mut users_lock = users.lock().unwrap();
                                             if let Some(user) = users_lock.get_mut(&user_id) {
                                                 let old = user.nickname.clone();
-                                                user.old_nickname = Some(old.clone());
                                                 user.nickname = nick.clone();
-                                                user.nickname_changed = true;
-                                                user.last_seen = Instant::now(); // Update last_seen on activity
+                                                user.last_seen = Instant::now();
                                                 old
                                             } else {
                                                 continue;
@@ -428,24 +463,24 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
                                         };
                                         debug_log(&format!("{} {} {}", old_nick, MESSAGE_NICKNAME_CHANGE, nick));
 
-                                        // Generate and broadcast control message to all clients
-                                        if let Err(e) = message_manager.broadcast_control_message("nickname_change", &old_nick, Some(&nick), &users, user_id) {
-                                            debug_log(&format!("Failed to broadcast nickname change message: {}", e));
+                                        // Generate and broadcast nickname change event to all clients
+                                        let nickname_change_event = ServerEvent::NicknameChange {
+                                            user_id,
+                                            old_nickname: old_nick,
+                                            new_nickname: nick.clone(),
+                                            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                                        };
+                                        if let Err(e) = message_manager.broadcast_global_event_excluding(&nickname_change_event, &users, user_id) {
+                                            debug_log(&format!("Failed to broadcast nickname change event: {}", e));
                                         }
 
                                         // Send signed confirmation back to client
                                         if let Err(e) = message_manager.send_signed_response(&format!("Your nickname is now: {}", nick), user_id, &users) {
                                             debug_log(&format!("Failed to send signed nickname confirmation: {}", e));
                                         }
-
-                                        // Reset nickname change flags after processing
-                                        if let Some(user) = users.lock().unwrap().get_mut(&user_id) {
-                                            user.nickname_changed = false;
-                                            user.old_nickname = None;
-                                        }
                                     }
                                     None => {
-                                        println!("Invalid nickname from {}: {}", initial_nickname, new_nick);
+                                        println!("Invalid nickname from user {}: {}", user_id, new_nick);
                                         // Send signed error response back to client
                                         if let Err(e) = message_manager.send_signed_response(&format!("Error: Invalid nickname '{}'. Use 1-16 alphanumeric characters only.", new_nick), user_id, &users) {
                                             debug_log(&format!("Failed to send signed nickname error: {}", e));
@@ -455,7 +490,9 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
                             } else if sanitized == COMMAND_WHO {
                                 let user_list = {
                                     let users_lock = users.lock().unwrap();
+                                    let now = Instant::now();
                                     let mut names: Vec<String> = users_lock.values()
+                                        .filter(|u| now.duration_since(u.last_seen).as_secs() <= MAX_LAST_SEEN_SECONDS)
                                         .map(|u| u.nickname.clone())
                                         .collect();
                                     names.sort();
@@ -496,103 +533,96 @@ fn handle_client(user_id: usize, mut tls_stream: TlsStream, users: SharedUsers, 
                                         debug_log(&format!("Failed to send signed response: {}", e));
                                     }
                                     // Send signed welcome message now that key is registered
-                                    let signed_welcome = format!("🔐 Secure connection established! All messages are now signed and verified.");
+                                    let signed_welcome = "🔐 Secure connection established! All messages are now signed and verified.";
                                     if let Err(e) = message_manager.send_signed_response(&signed_welcome, user_id, &users) {
                                         debug_log(&format!("Failed to send signed welcome: {}", e));
                                     }
                                 } else {
+                                    println!("Invalid key format from user {}: {}", user_id, key_part);
                                     // Send signed error response
-                                    if let Err(e) = message_manager.send_signed_response("Error: Invalid key format. Use base64 encoding.", user_id, &users) {
-                                        debug_log(&format!("Failed to send signed key format error: {}", e));
+                                    if let Err(e) = message_manager.send_signed_response(&format!("Error: Invalid key format. Use base64 encoded key."), user_id, &users) {
+                                        debug_log(&format!("Failed to send signed key error: {}", e));
                                     }
                                 }
-                            } else if sanitized == "/signing_status" {
+                            } else if sanitized == COMMAND_SIGNING_STATUS {
                                 // Check if client has registered a signing key
                                 let has_key = {
                                     let keys_lock = message_manager.client_keys.lock().unwrap();
                                     keys_lock.contains_key(&user_id)
                                 };
-
                                 let status_msg = if has_key {
-                                    "✅ Client signing key is registered and active"
+                                    "🔐 Client signing key is registered and active"
                                 } else {
-                                    "⚠️  No client signing key registered. Use /register_key <key> to register."
+                                    "❌ Client signing key is not registered"
                                 };
-
+                                // Send signed status response
                                 if let Err(e) = message_manager.send_signed_response(status_msg, user_id, &users) {
                                     debug_log(&format!("Failed to send signed signing status: {}", e));
                                 }
                             } else if sanitized == COMMAND_QUIT {
-                                debug_log(&format!("User {} requested to quit", user_id));
-
-                                // Send signed confirmation to client
+                                println!("User {} is quitting", user_id);
+                                // Send signed quit confirmation
                                 if let Err(e) = message_manager.send_signed_response("Goodbye!", user_id, &users) {
-                                    debug_log(&format!("Failed to send signed goodbye: {}", e));
+                                    debug_log(&format!("Failed to send signed quit message: {}", e));
                                 }
-
-                                // Small delay to ensure message is sent before breaking
-                                thread::sleep(Duration::from_millis(100));
-
-                                // Break from the client loop to trigger cleanup
                                 break;
                             } else {
-                                // Regular message - update last_seen
-                                let nickname = {
+                                // Regular chat message - update last_seen and broadcast
+                                {
                                     let mut users_lock = users.lock().unwrap();
                                     if let Some(user) = users_lock.get_mut(&user_id) {
                                         user.last_seen = Instant::now();
-                                        user.nickname.clone()
-                                    } else {
-                                        String::new()
                                     }
-                                };
-                                debug_log(&format!("{}: {}", nickname, sanitized));
-
-                                // Broadcast this message to all connected clients (excluding sender)
-                                let message = format!("[{}]: {}", nickname, sanitized);
-                                if let Err(e) = message_manager.broadcast_signed_chat_message(&message, user_id, &users) {
-                                    debug_log(&format!("Failed to broadcast signed chat message: {}", e));
                                 }
 
-                                // Also echo back to sender with signed confirmation
-                                if let Err(e) = message_manager.send_signed_response(&message, user_id, &users) {
-                                    debug_log(&format!("Failed to send signed message echo: {}", e));
+                                let nickname = {
+                                    let users_lock = users.lock().unwrap();
+                                    users_lock.get(&user_id).map(|u| u.nickname.clone()).unwrap_or_else(|| "Unknown".to_string())
+                                };
+
+                                let message = format!("[{}]: {}", nickname, sanitized);
+                                println!("{}", message);
+
+                                // Broadcast signed chat message to all other users
+                                if let Err(e) = message_manager.broadcast_signed_chat_message(&message, user_id, &users) {
+                                    debug_log(&format!("Failed to broadcast signed chat message: {}", e));
                                 }
                             }
                         }
                     }
                 }
             }
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::WouldBlock {
-                    // No data available right now - this is normal for non-blocking I/O
-                } else {
-                    debug_log(&format!("Read error from user {}: {}", user_id, e));
-                    break;
-                }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // No data available, continue to next iteration
             }
+            Err(_) => break, // Connection error
         }
 
-        // Small sleep only if no work was done to prevent CPU spinning
-        if !processed_outgoing {
-            thread::sleep(Duration::from_millis(10));
-        }
+        // Small sleep to prevent busy waiting and reduce CPU usage
+        thread::sleep(Duration::from_millis(10));
     }
 
-    // Cleanup
+    // Cleanup: Remove user from collection and notify others
     let nickname = {
         let mut users_lock = users.lock().unwrap();
-        users_lock.remove(&user_id).map(|u| u.nickname).unwrap_or_default()
+        users_lock.remove(&user_id).map(|u| u.nickname).unwrap_or_else(|| format!("User{}", user_id))
     };
 
     println!("{} {}", nickname, MESSAGE_LEFT_CHAT);
 
-    // Broadcast leave notification to all remaining users
-    if let Err(e) = message_manager.broadcast_control_message("user_leave", &nickname, None, &users, user_id) {
-        debug_log(&format!("Failed to broadcast leave message: {}", e));
+    // Broadcast user leave event to all remaining users
+    let leave_event = ServerEvent::UserLeave {
+        user_id,
+        nickname: nickname.clone(),
+        reason: "disconnected".to_string(),
+        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+    };
+    if let Err(e) = message_manager.broadcast_global_event(&leave_event, &users) {
+        debug_log(&format!("Failed to broadcast leave event: {}", e));
     }
 }
 
+// Unified status generation
 fn generate_status_json(users: &SharedUsers) -> String {
     let current_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -610,74 +640,105 @@ fn generate_status_json(users: &SharedUsers) -> String {
             nickname: user.nickname.clone(),
             state: user.state.clone(),
             last_seen: last_seen_seconds,
-            nickname_changed: user.nickname_changed,
-            old_nickname: user.old_nickname.clone(),
+            nickname_changed: false, // This would need more sophisticated tracking
+            old_nickname: None,
         });
     }
 
     let status_response = StatusResponse {
         timestamp: current_time,
-        users: user_statuses.clone(),
-        total_users: user_statuses.len(),
+        users: user_statuses,
+        total_users: users_lock.len(),
     };
 
     serde_json::to_string(&status_response).unwrap_or_else(|_| "{}".to_string())
 }
 
+// Generate roster snapshot event for event-driven updates
+fn generate_roster_snapshot_event(users: &SharedUsers) -> Result<ServerEvent, Box<dyn std::error::Error>> {
+    let current_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
 
+    let users_lock = users.lock().unwrap();
+    let mut user_statuses = Vec::new();
 
-fn cleanup_disconnected_users(users: &SharedUsers, message_manager: &MessageManager) {
-    let mut users_to_remove = Vec::new();
+    for (&id, user) in users_lock.iter() {
+        let last_seen_seconds = user.last_seen.elapsed().as_secs();
+
+        user_statuses.push(UserStatus {
+            id,
+            nickname: user.nickname.clone(),
+            state: user.state.clone(),
+            last_seen: last_seen_seconds,
+            nickname_changed: false,
+            old_nickname: None,
+        });
+    }
+
+    Ok(ServerEvent::RosterSnapshot {
+        users: user_statuses,
+        total_users: users_lock.len(),
+        timestamp: current_time,
+    })
+}
+
+// Unified cleanup function for disconnected users
+fn cleanup_disconnected_users(users: &SharedUsers, message_manager: &Arc<MessageManager>) {
+    let mut to_remove = Vec::new();
+    
     {
         let users_lock = users.lock().unwrap();
-        for (&id, user) in users_lock.iter() {
+        for (&user_id, user) in users_lock.iter() {
             if user.last_seen.elapsed().as_secs() > MAX_LAST_SEEN_SECONDS {
-                users_to_remove.push((id, user.nickname.clone()));
+                to_remove.push((user_id, user.nickname.clone()));
             }
         }
     }
 
-    for (user_id, nickname) in users_to_remove {
-        debug_log(&format!("Auto-removing inactive user: {} (id: {})", nickname, user_id));
-        let mut users_lock = users.lock().unwrap();
-        users_lock.remove(&user_id);
-
-        // Broadcast leave notification
-        drop(users_lock); // Release lock before broadcasting
-        if let Err(e) = message_manager.broadcast_control_message("user_timeout", &nickname, None, users, user_id) {
-            debug_log(&format!("Failed to broadcast timeout message: {}", e));
+    for (user_id, nickname) in to_remove {
+        {
+            let mut users_lock = users.lock().unwrap();
+            users_lock.remove(&user_id);
+        }
+        
+        println!("{} {}", nickname, MESSAGE_TIMED_OUT_LEFT);
+        
+        // Broadcast timeout event to remaining users
+        let timeout_event = ServerEvent::UserTimeout {
+            user_id,
+            nickname: nickname.clone(),
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        };
+        if let Err(e) = message_manager.broadcast_global_event(&timeout_event, users) {
+            debug_log(&format!("Failed to broadcast timeout event: {}", e));
         }
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Check for --debug flag
-    let args: Vec<String> = std::env::args().collect();
-    if args.contains(&"--debug".to_string()) {
-        DEBUG.store(true, std::sync::atomic::Ordering::Relaxed);
-        println!("Debug mode enabled");
-    }
+    // Enable debug mode
+    DEBUG.store(true, std::sync::atomic::Ordering::Relaxed);
 
-    // Create MessageManager for handling signed messages
-    let message_manager = MessageManager::new(KEY_PATH, CERT_PATH)?;
-
-    // Use the same certs and key for TLS configuration
-    let certs = message_manager.public_cert.clone();
-    // Load the key file for TLS configuration using the proper loader
+    let listener = TcpListener::bind("0.0.0.0:8443")?;
+    
+    let certs = load_certs(CERT_PATH)?;
     let key = load_private_key(KEY_PATH)?;
-
+    
     let config = ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
-
-    let config = Arc::new(config);
+    
+    let message_manager = Arc::new(MessageManager::new(KEY_PATH, CERT_PATH)?);
     let users: SharedUsers = Arc::new(Mutex::new(HashMap::new()));
-    let message_manager = Arc::new(message_manager); // Make it shareable across threads
-    let listener = TcpListener::bind("0.0.0.0:8443")?;
+
+    println!("TLS Chat Server started on 0.0.0.0:8443 (max {} users)", MAX_USERS);
+
     let mut user_counter = 0;
 
-    // Start background cleanup thread
+    // Start background cleanup thread for timed-out users
     let users_cleanup = users.clone();
     let message_manager_cleanup = message_manager.clone();
     thread::spawn(move || {
@@ -687,11 +748,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    println!("TLS Chat Server started on 0.0.0.0:8443 (max {} users)", MAX_USERS);
+    // Start background roster snapshot thread (replaces 1-3 second polling)
+    let users_roster = users.clone();
+    let message_manager_roster = message_manager.clone();
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(ROSTER_SNAPSHOT_INTERVAL_SECONDS)); // Every 30 seconds
+            let roster_event = generate_roster_snapshot_event(&users_roster);
+            if let Ok(event) = roster_event {
+                if let Err(e) = message_manager_roster.broadcast_global_event(&event, &users_roster) {
+                    debug_log(&format!("Failed to broadcast roster snapshot: {}", e));
+                }
+            }
+        }
+    });
 
     for stream in listener.incoming() {
         match stream {
             Ok(tcp_stream) => {
+                user_counter += 1;
+                
+                // Check user limit
                 {
                     let users_lock = users.lock().unwrap();
                     if users_lock.len() >= MAX_USERS {
@@ -701,26 +778,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                let config = config.clone();
-                let users = users.clone();
-                let message_manager = message_manager.clone();
-                user_counter += 1;
-                let user_id = user_counter;
-
-                thread::spawn(move || {
-                    match ServerConnection::new(config) {
-                        Ok(conn) => {
-                            let tls_stream = StreamOwned::new(conn, tcp_stream);
-                            handle_client(user_id, tls_stream, users, message_manager);
-                        }
-                        Err(e) => {
-                            println!("TLS connection failed: {}", e);
-                        }
+                match ServerConnection::new(Arc::new(config.clone())) {
+                    Ok(conn) => {
+                        let tls_stream = StreamOwned::new(conn, tcp_stream);
+                        let users_clone = users.clone();
+                        let message_manager_clone = message_manager.clone();
+                        
+                        thread::spawn(move || {
+                            handle_client(user_counter, tls_stream, users_clone, message_manager_clone);
+                        });
                     }
-                });
+                    Err(e) => {
+                        println!("Failed to create TLS connection: {}", e);
+                    }
+                }
             }
             Err(e) => {
-                eprintln!("Error accepting connection: {}", e);
+                println!("Connection failed: {}", e);
             }
         }
     }

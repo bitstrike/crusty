@@ -1,3 +1,4 @@
+// client.rs - Fixed Client implementation for TLS Chat system
 use std::io::{self, Write, Read};
 use std::net::TcpStream;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -7,8 +8,8 @@ use std::time::{SystemTime, Duration};
 
 use rustls::{ClientConfig, ClientConnection, StreamOwned, Certificate, ServerName};
 use rustls::client::{ServerCertVerifier, ServerCertVerified};
-use serde::{Serialize, Deserialize};
-use rand::{Rng, RngCore};
+// Removed unused serde imports
+use rand::RngCore;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use base64::{Engine as _, engine::general_purpose};
@@ -41,7 +42,7 @@ impl ServerCertVerifier for ConfigurableCertVerifier {
     ) -> Result<ServerCertVerified, rustls::Error> {
         if self.allow_self_signed {
             debug_log("Accepting self-signed certificate (--allow-self-signed enabled)");
-        Ok(ServerCertVerified::assertion())
+            Ok(ServerCertVerified::assertion())
         } else {
             // Use default WebPKI verification for production
             Err(rustls::Error::General("Certificate verification not implemented for production use".into()))
@@ -149,27 +150,27 @@ impl UnifiedStreamHandler {
     }
     
     fn write_with_retry(stream: &mut TlsStream, msg: &str) -> std::io::Result<()> {
-                    let mut retry_count = 0;
+        let mut retry_count = 0;
         const MAX_RETRIES: usize = 10;
                     
         while retry_count < MAX_RETRIES {
-                        match write!(stream, "{}\r\n", msg) {
-                            Ok(()) => {
-                                match stream.flush() {
-                                    Ok(()) => {
-                                        debug_log(&format!("Sent: {}", msg));
+            match write!(stream, "{}\r\n", msg) {
+            Ok(()) => {
+                    match stream.flush() {
+                        Ok(()) => {
+                            debug_log(&format!("Sent: {}", msg));
                             return Ok(());
-                                    }
+                        }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                            thread::sleep(Duration::from_millis(5));
-                                            retry_count += 1;
-                                        }
+                            thread::sleep(Duration::from_millis(5));
+                            retry_count += 1;
+                        }
                         Err(e) => return Err(e),
-                                    }
-                                }
+                    }
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                    thread::sleep(Duration::from_millis(5));
-                                    retry_count += 1;
+                    thread::sleep(Duration::from_millis(5));
+                    retry_count += 1;
                 }
                 Err(e) => return Err(e),
             }
@@ -187,24 +188,24 @@ impl UnifiedStreamHandler {
         tx_output: &Sender<String>,
         client_type: &String,
     ) -> std::io::Result<()> {
-                let mut temp_buf = [0u8; 1024];
-                match stream.read(&mut temp_buf) {
-                    Ok(0) => {
+        let mut temp_buf = [0u8; 1024];
+        match stream.read(&mut temp_buf) {
+            Ok(0) => {
                 debug_log(&format!("{} server closed connection", client_type));
-                        let _ = tx_output.send("DISCONNECT".to_string());
+                let _ = tx_output.send("DISCONNECT".to_string());
                 Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "Server closed"))
-                    }
-                    Ok(n) => {
-                        if let Ok(data) = std::str::from_utf8(&temp_buf[..n]) {
-                            read_buffer.push_str(data);
-                            
-                            while let Some(newline_pos) = read_buffer.find('\n') {
-                                let line = read_buffer[..newline_pos].trim().to_string();
+            }
+            Ok(n) => {
+                if let Ok(data) = std::str::from_utf8(&temp_buf[..n]) {
+                    read_buffer.push_str(data);
+                    
+                    while let Some(newline_pos) = read_buffer.find('\n') {
+                        let line = read_buffer[..newline_pos].trim().to_string();
                         *read_buffer = read_buffer[newline_pos + 1..].to_string();
-                                
-                                if !line.is_empty() {
+                        
+                        if !line.is_empty() {
                             debug_log(&format!("{} received: {}", client_type, line));
-                                    if tx_output.send(line).is_err() {
+                            if tx_output.send(line).is_err() {
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::BrokenPipe, 
                                     "Output channel disconnected"
@@ -220,41 +221,156 @@ impl UnifiedStreamHandler {
     }
 }
 
-// Common trait for both chat clients
-trait ChatClient {
-    fn sign_and_send_message(&self, message: &str, tx: &Sender<String>) -> Result<(), Box<dyn std::error::Error>>;
-}
-
-// Updated DebugChatClient using unified components
-struct DebugChatClient {
-    nickname: String,
-    running: bool,
-    tx_write: Option<Sender<String>>,
-    rx_output: Option<Receiver<String>>,
+// Unified message processor for both client types
+struct UnifiedMessageProcessor {
     key_manager: UnifiedKeyManager,
+    nickname: String,
     key_registered: bool,
-    allow_self_signed: bool,
+    messages: std::collections::VecDeque<String>,
+    users: Vec<String>,
+    status: String,
 }
 
-impl ChatClient for DebugChatClient {
+impl UnifiedMessageProcessor {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            key_manager: UnifiedKeyManager::new()?,
+            nickname: "User".to_string(),
+            key_registered: false,
+            messages: std::collections::VecDeque::new(),
+            users: Vec::new(),
+            status: "Initializing...".to_string(),
+        })
+    }
+
+    fn process_server_message(&mut self, msg: String) -> ProcessedMessage {
+        // Handle key registration success - only update status, don't show in chat
+        if msg.contains(RESPONSE_KEY_REGISTERED) {
+            self.key_registered = true;
+            self.status = "✅ Signing key registered with server".to_string();
+            debug_log("🔑 Client signing key registered successfully");
+            return ProcessedMessage::StatusUpdate;
+        }
+        
+        // Handle event-driven messages from server
+        if let Ok(event) = serde_json::from_str::<ServerEvent>(&msg) {
+            return self.handle_server_event(event);
+        }
+        
+        // Add normal messages to chat history
+        self.messages.push_back(msg.clone());
+        if self.messages.len() > MAX_CHAT_HISTORY_LINES {
+            self.messages.pop_front();
+        }
+        
+        ProcessedMessage::ChatMessage(msg)
+    }
+
+    fn handle_server_event(&mut self, event: ServerEvent) -> ProcessedMessage {
+        match event {
+            ServerEvent::UserJoin { nickname, .. } => {
+                let join_msg = format!("*** {} joined the chat ***", nickname);
+                self.messages.push_back(join_msg.clone());
+                self.update_user_list();
+                ProcessedMessage::ChatMessage(join_msg)
+            },
+            ServerEvent::UserLeave { nickname, reason, .. } => {
+                let leave_msg = format!("*** {} left the chat ({}) ***", nickname, reason);
+                self.messages.push_back(leave_msg.clone());
+                self.update_user_list();
+                ProcessedMessage::ChatMessage(leave_msg)
+            },
+            ServerEvent::UserTimeout { nickname, .. } => {
+                let timeout_msg = format!("*** {} timed out and left the chat ***", nickname);
+                self.messages.push_back(timeout_msg.clone());
+                self.update_user_list();
+                ProcessedMessage::ChatMessage(timeout_msg)
+            },
+            ServerEvent::NicknameChange { old_nickname, new_nickname, .. } => {
+                let change_msg = format!("*** {} is now known as {} ***", old_nickname, new_nickname);
+                self.messages.push_back(change_msg.clone());
+                self.update_user_list();
+                ProcessedMessage::ChatMessage(change_msg)
+            },
+            ServerEvent::RosterSnapshot { users, total_users, .. } => {
+                self.update_roster_from_snapshot(users);
+                self.status = format!("✅ Connected | {} users online", total_users);
+                ProcessedMessage::StatusUpdate
+            },
+            ServerEvent::ConnectionEstablished { nickname, .. } => {
+                self.nickname = nickname;
+                self.status = "✅ Connected and authenticated".to_string();
+                ProcessedMessage::StatusUpdate
+            },
+            ServerEvent::WelcomeMessage { message, .. } => {
+                let welcome_msg = format!("🔐 {}", message);
+                self.messages.push_back(welcome_msg.clone());
+                ProcessedMessage::ChatMessage(welcome_msg)
+            },
+            ServerEvent::KeyRegistration { .. } => {
+                self.key_registered = true;
+                self.status = "✅ Signing key registered with server".to_string();
+                ProcessedMessage::StatusUpdate
+            },
+            ServerEvent::CommandResponse { response, .. } => {
+                let cmd_msg = format!("📋 {}", response);
+                self.messages.push_back(cmd_msg.clone());
+                ProcessedMessage::ChatMessage(cmd_msg)
+            },
+            ServerEvent::ErrorResponse { error, .. } => {
+                let err_msg = format!("❌ {}", error);
+                self.messages.push_back(err_msg.clone());
+                ProcessedMessage::ChatMessage(err_msg)
+            },
+            _ => {
+                debug_log(&format!("Unhandled server event: {:?}", event));
+                ProcessedMessage::StatusUpdate
+            }
+        }
+    }
+
+    fn update_user_list(&mut self) {
+        self.status = "🔄 Updating user list...".to_string();
+    }
+
+    fn update_roster_from_snapshot(&mut self, users: Vec<config::UserStatus>) {
+        self.users = users.into_iter().map(|u| u.nickname).collect();
+        debug_log(&format!("Updated roster: {} users", self.users.len()));
+    }
+
     fn sign_and_send_message(&self, message: &str, tx: &Sender<String>) -> Result<(), Box<dyn std::error::Error>> {
         let signed_message = self.key_manager.sign_message(message)?;
         tx.send(signed_message)?;
         Ok(())
     }
+
+    fn get_signing_key_b64(&self) -> String {
+        self.key_manager.get_signing_key_b64()
+    }
 }
 
-impl DebugChatClient {
-    fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self {
-            nickname: "User".to_string(),
-            running: false,
+#[derive(Debug)]
+enum ProcessedMessage {
+    ChatMessage(String),
+    StatusUpdate,
+}
+
+// Connection management
+struct UnifiedConnection {
+    tx_write: Option<Sender<String>>,
+    rx_output: Option<Receiver<String>>,
+    running: bool,
+    allow_self_signed: bool,
+}
+
+impl UnifiedConnection {
+    fn new() -> Self {
+        Self {
             tx_write: None,
             rx_output: None,
-            key_manager: UnifiedKeyManager::new()?,
-            key_registered: false,
+            running: false,
             allow_self_signed: false,
-        })
+        }
     }
 
     fn connect(&mut self, host: &str, port: u16, allow_self_signed: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -285,38 +401,66 @@ impl DebugChatClient {
         self.tx_write = Some(tx_write);
         self.rx_output = Some(rx_output);
 
-        // Register signing key
-        debug_log("🔑 Registering client signing key...");
-        let key_base64 = self.key_manager.get_signing_key_b64();
-        if let Some(ref tx) = self.tx_write {
-            let _ = tx.send(format!("{} {}", COMMAND_REGISTER_KEY, key_base64));
-        }
-        
-        thread::sleep(Duration::from_millis(KEY_REGISTRATION_WAIT_MS));
-
         // Use unified stream handler
-        UnifiedStreamHandler::handle_stream(tls_stream, rx_write, tx_output, "DEBUG".to_string());
+        UnifiedStreamHandler::handle_stream(tls_stream, rx_write, tx_output, "CLIENT".to_string());
 
         Ok(())
     }
 
+    fn register_key(&self, key_base64: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(ref tx) = self.tx_write {
+            let _ = tx.send(format!("{} {}", COMMAND_REGISTER_KEY, key_base64));
+            thread::sleep(Duration::from_millis(KEY_REGISTRATION_WAIT_MS));
+            Ok(())
+                                        } else {
+            Err("Not connected".into())
+        }
+    }
+}
+
+// Debug Chat Client using unified components
+struct DebugChatClient {
+    connection: UnifiedConnection,
+    processor: UnifiedMessageProcessor,
+}
+
+impl DebugChatClient {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            connection: UnifiedConnection::new(),
+            processor: UnifiedMessageProcessor::new()?,
+        })
+    }
+
+    fn connect(&mut self, host: &str, port: u16, allow_self_signed: bool) -> Result<(), Box<dyn std::error::Error>> {
+        self.connection.connect(host, port, allow_self_signed)?;
+        
+        // Register signing key
+        debug_log("🔑 Registering client signing key...");
+        let key_base64 = self.processor.get_signing_key_b64();
+        self.connection.register_key(&key_base64)?;
+        
+        Ok(())
+    }
+
     fn run_terminal(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let rx_output = self.rx_output.take().unwrap();
+        let rx_output = self.connection.rx_output.take().unwrap();
         
         println!("=== Debug Chat Client ===");
         println!("Cert file: {}", CERT_PATH);
-        let cert_indicator = if self.allow_self_signed { "⚠️ SS cert" } else { "🔒 Cert" };
+        let cert_indicator = if self.connection.allow_self_signed { "⚠️ SS cert" } else { "🔒 Cert" };
         println!("Certificate: {}", cert_indicator);
         println!("Commands: /nick <name>, /who, /quit");
         println!("===========================");
 
         // Input handling thread
-        let tx_write = self.tx_write.clone();
-        let key_manager = self.key_manager.clone();
+        let tx_write = self.connection.tx_write.clone();
+        let key_manager = self.processor.key_manager.clone();
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let running_clone = running.clone();
         
         thread::spawn(move || {
+            let mut current_nick = String::from("you");
             loop {
                 print!("> ");
                 io::stdout().flush().unwrap();
@@ -339,11 +483,24 @@ impl DebugChatClient {
                                     }
                                 };
                                 
-                                if tx.send(message_to_send).is_err() || msg == "/quit" {
-                                        running_clone.store(false, std::sync::atomic::Ordering::Relaxed);
-                                        break;
+                                // If changing nickname, update our local display name immediately
+                                if let Some(rest) = msg.strip_prefix("/nick ") {
+                                    let new_nick = rest.trim();
+                                    if !new_nick.is_empty() {
+                                        current_nick = new_nick.to_string();
                                     }
                                 }
+
+                                let send_failed = tx.send(message_to_send).is_err();
+                                // Local echo for non-command messages
+                                if !msg.starts_with('/') {
+                                    println!("[{}]: {}", current_nick, msg);
+                                }
+                                if send_failed || msg == "/quit" {
+                                    running_clone.store(false, std::sync::atomic::Ordering::Relaxed);
+                                    break;
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -361,11 +518,26 @@ impl DebugChatClient {
                 if msg == "DISCONNECT" {
                     println!("\n[CONNECTION LOST]");
                     break;
-                } else if msg.contains("Client signing key registered successfully") {
-                    self.key_registered = true;
-                    println!("🔑 {}", msg);
                 } else {
-                    println!("<< {}", msg);
+                    match self.processor.process_server_message(msg) {
+                        ProcessedMessage::ChatMessage(chat_msg) => {
+                            if chat_msg.contains(RESPONSE_KEY_REGISTERED) {
+                                println!("🔑 {}", chat_msg);
+                            } else if let Some(rest) = chat_msg.strip_prefix("📋 Your nickname is now: ") {
+                                // Sync local nickname if server confirms change
+                                let new_nick = rest.trim();
+                                if !new_nick.is_empty() {
+                                    self.processor.nickname = new_nick.to_string();
+                                }
+                                println!("<< {}", chat_msg);
+                            } else {
+                                println!("<< {}", chat_msg);
+                            }
+                        }
+                        ProcessedMessage::StatusUpdate => {
+                            // Status updates handled internally by processor
+                        }
+                    }
                 }
             }
             thread::sleep(Duration::from_millis(50));
@@ -390,94 +562,38 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
-use std::collections::VecDeque;
+// Removed unused VecDeque import
+use serde_json;
 
 struct TuiChatClient {
-    nickname: String,
-    messages: VecDeque<String>,
-    users: Vec<String>,
+    connection: UnifiedConnection,
+    processor: UnifiedMessageProcessor,
     input: String,
-    status: String,
-    tx_write: Option<Sender<String>>,
-    rx_output: Option<Receiver<String>>,
-    running: bool,
-    last_heartbeat: std::time::Instant,
-    heartbeat_interval: Duration,
+    cursor_position: usize,
     scroll_offset: usize,
     auto_scroll: bool,
-    cursor_position: usize,
-    key_manager: UnifiedKeyManager,
-    key_registered: bool,
-    allow_self_signed: bool,
-}
-
-impl ChatClient for TuiChatClient {
-    fn sign_and_send_message(&self, message: &str, tx: &Sender<String>) -> Result<(), Box<dyn std::error::Error>> {
-        let signed_message = self.key_manager.sign_message(message)?;
-        tx.send(signed_message)?;
-        Ok(())
-    }
 }
 
 impl TuiChatClient {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let mut rng = rand::thread_rng();
-        let heartbeat_interval = Duration::from_millis(
-            HEARTBEAT_INTERVAL_MIN_MS + rng.gen_range(0..(HEARTBEAT_INTERVAL_MAX_MS - HEARTBEAT_INTERVAL_MIN_MS))
-        );
-        
         Ok(Self {
-            nickname: "User".to_string(),
-            messages: VecDeque::new(),
-            users: Vec::new(),
+            connection: UnifiedConnection::new(),
+            processor: UnifiedMessageProcessor::new()?,
             input: String::new(),
-            status: "Initializing...".to_string(),
-            tx_write: None,
-            rx_output: None,
-            running: false,
-            last_heartbeat: std::time::Instant::now(),
-            heartbeat_interval,
+            cursor_position: 0,
             scroll_offset: 0,
             auto_scroll: true,
-            cursor_position: 0,
-            key_manager: UnifiedKeyManager::new()?,
-            key_registered: false,
-            allow_self_signed: false,
         })
     }
 
     fn connect(&mut self, host: &str, port: u16, allow_self_signed: bool) -> Result<(), Box<dyn std::error::Error>> {
-        self.allow_self_signed = allow_self_signed;
-        self.status = format!("Connecting to {}:{}...", host, port);
+        self.processor.status = format!("Connecting to {}:{}...", host, port);
         debug_log(&format!("TUI client connecting to {}:{}", host, port));
         
-        let config = ClientConfig::builder()
-            .with_safe_defaults()
-            .with_custom_certificate_verifier(std::sync::Arc::new(
-                ConfigurableCertVerifier::new(allow_self_signed)
-            ))
-            .with_no_client_auth();
-
-        let tcp_stream = TcpStream::connect(format!("{}:{}", host, port))?;
-        tcp_stream.set_nonblocking(true)?;
+        self.connection.connect(host, port, allow_self_signed)?;
         
-        let server_name = host.try_into()?;
-        let conn = ClientConnection::new(std::sync::Arc::new(config), server_name)?;
-        let tls_stream = StreamOwned::new(conn, tcp_stream);
-
-        self.status = "Connected! Setting up chat...".to_string();
-        thread::sleep(Duration::from_millis(100));
+        self.processor.status = "Connected! Setting up chat...".to_string();
         
-        self.running = true;
-
-        let (tx_write, rx_write) = channel();
-        let (tx_output, rx_output) = channel();
-        
-        self.tx_write = Some(tx_write);
-        self.rx_output = Some(rx_output);
-
-        // Use unified stream handler
-        UnifiedStreamHandler::handle_stream(tls_stream, rx_write, tx_output, "TUI".to_string());
         Ok(())
     }
 
@@ -489,17 +605,15 @@ impl TuiChatClient {
         let mut terminal = Terminal::new(backend)?;
 
         // Register signing key
-        self.status = "Registering signing key...".to_string();
-        let key_base64 = self.key_manager.get_signing_key_b64();
-        self.send_message(format!("{} {}", COMMAND_REGISTER_KEY, key_base64))?;
+        self.processor.status = "Registering signing key...".to_string();
+        let key_base64 = self.processor.get_signing_key_b64();
+        self.connection.register_key(&key_base64)?;
         
-        thread::sleep(Duration::from_millis(KEY_REGISTRATION_WAIT_MS));
-        
-        self.status = "Getting user list...".to_string();
+        self.processor.status = "Getting user list...".to_string();
         thread::sleep(Duration::from_millis(CONNECTION_STABILIZATION_MS));
         self.send_message(COMMAND_WHO.to_string())?;
 
-        let rx_output = self.rx_output.take().unwrap();
+        let rx_output = self.connection.rx_output.take().unwrap();
         let result = self.run_tui_loop(&mut terminal, rx_output);
 
         disable_raw_mode()?;
@@ -518,6 +632,9 @@ impl TuiChatClient {
         let tick_rate = Duration::from_millis(100);
 
         loop {
+            // Adjust scroll offset to keep messages visible
+            self.adjust_scroll_for_display(terminal.size()?);
+            
             terminal.draw(|f| self.ui(f))?;
 
             let timeout = tick_rate.saturating_sub(last_tick.elapsed());
@@ -526,7 +643,7 @@ impl TuiChatClient {
                     if key.kind == KeyEventKind::Press {
                         match key.code {
                             KeyCode::Char('q') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
-                                self.status = "Disconnecting...".to_string();
+                                self.processor.status = "Disconnecting...".to_string();
                                 self.send_message("/quit".to_string())?;
                                 break;
                             }
@@ -537,11 +654,29 @@ impl TuiChatClient {
                                     self.cursor_position = 0;
                                     
                                     if message == "/quit" {
-                                        self.status = "Disconnecting...".to_string();
+                                        self.processor.status = "Disconnecting...".to_string();
                                         self.send_message(message)?;
                                         break;
                                     } else {
-                                        self.status = "Message sent".to_string();
+                                        // If user changes nickname locally, update immediately for local echo formatting
+                                        if let Some(rest) = message.strip_prefix("/nick ") {
+                                            let new_nick = rest.trim();
+                                            if !new_nick.is_empty() {
+                                                self.processor.nickname = new_nick.to_string();
+                                            }
+                                        }
+                                        // If it's not a command, append our own message locally
+                                        if !message.starts_with('/') {
+                                            let display = format!("[{}]: {}", self.processor.nickname, message);
+                                            self.processor.messages.push_back(display);
+                                            if self.processor.messages.len() > MAX_CHAT_HISTORY_LINES {
+                                                self.processor.messages.pop_front();
+                                            }
+                                            if self.auto_scroll {
+                                                self.scroll_offset = 0;
+                                            }
+                                        }
+                                        self.processor.status = "Message sent".to_string();
                                         self.send_message(message)?;
                                     }
                                 }
@@ -568,6 +703,34 @@ impl TuiChatClient {
                                     self.cursor_position += 1;
                                 }
                             }
+                            KeyCode::Up => {
+                                // Manual scroll up
+                                self.auto_scroll = false;
+                                if self.scroll_offset < self.processor.messages.len().saturating_sub(1) {
+                                    self.scroll_offset += 1;
+                                }
+                            }
+                            KeyCode::Down => {
+                                // Manual scroll down
+                                if self.scroll_offset > 0 {
+                                    self.scroll_offset -= 1;
+                                } else {
+                                    // Re-enable auto scroll when at bottom
+                                    self.auto_scroll = true;
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                self.auto_scroll = false;
+                                self.scroll_offset = (self.scroll_offset + 10).min(self.processor.messages.len().saturating_sub(1));
+                            }
+                            KeyCode::PageDown => {
+                                if self.scroll_offset >= 10 {
+                                    self.scroll_offset -= 10;
+                                } else {
+                                    self.scroll_offset = 0;
+                                    self.auto_scroll = true;
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -577,22 +740,15 @@ impl TuiChatClient {
             // Process incoming messages
             while let Ok(msg) = rx_output.try_recv() {
                 if msg == "DISCONNECT" {
-                    self.status = "Connection lost!".to_string();
+                    self.processor.status = "Connection lost!".to_string();
                     break;
                 } else {
-                    self.process_message(msg);
+                    let result = self.processor.process_server_message(msg);
+                    if matches!(result, ProcessedMessage::ChatMessage(_)) && self.auto_scroll {
+                        // Keep scroll at bottom for new messages when auto-scrolling
+                        self.scroll_offset = 0;
+                    }
                 }
-            }
-
-            // Heartbeat
-            if self.last_heartbeat.elapsed() >= self.heartbeat_interval {
-                if let Err(e) = self.send_message("/status".to_string()) {
-                    debug_log(&format!("Heartbeat failed: {}", e));
-                }
-                self.last_heartbeat = std::time::Instant::now();
-                
-                let mut rng = rand::thread_rng();
-                self.heartbeat_interval = Duration::from_millis(1000 + rng.gen_range(0..2000));
             }
 
             if last_tick.elapsed() >= tick_rate {
@@ -603,23 +759,25 @@ impl TuiChatClient {
         Ok(())
     }
 
-    fn process_message(&mut self, msg: String) {
-        // Handle key registration success - only update status, don't show in chat
-        if msg.contains(RESPONSE_KEY_REGISTERED) {
-            self.key_registered = true;
-            self.status = "✅ Signing key registered with server".to_string();
-            debug_log("🔑 Client signing key registered successfully");
-            return; // Don't add to chat history
-        }
+    fn adjust_scroll_for_display(&mut self, size: ratatui::layout::Rect) {
+        // Calculate available height for messages (accounting for borders and input/status bars)
+        let available_height = size.height.saturating_sub(6) as usize; // 3 lines for input/status + borders
+        let total_messages = self.processor.messages.len();
         
-        // Add normal messages to chat history
-        self.messages.push_back(msg);
-        if self.messages.len() > MAX_CHAT_HISTORY_LINES {
-            self.messages.pop_front();
-        }
-        
-        if self.auto_scroll {
+        if total_messages <= available_height {
+            // All messages fit, no scrolling needed
             self.scroll_offset = 0;
+            } else {
+            // Auto-scroll to bottom when new messages arrive (if auto_scroll is enabled)
+        if self.auto_scroll {
+                self.scroll_offset = 0; // 0 means show most recent messages
+        } else {
+                // Ensure scroll_offset doesn't exceed bounds
+                let max_scroll = total_messages.saturating_sub(available_height);
+                if self.scroll_offset > max_scroll {
+                    self.scroll_offset = max_scroll;
+                }
+            }
         }
     }
 
@@ -629,17 +787,40 @@ impl TuiChatClient {
             .constraints([Constraint::Min(1), Constraint::Length(3), Constraint::Length(1)].as_ref())
             .split(f.size());
 
-        // Messages
-        let messages: Vec<ListItem> = self.messages
-            .iter()
-            .map(|m| ListItem::new(Line::from(Span::raw(m))))
-            .collect();
+        // Calculate visible message range based on scroll offset and available height
+        let available_height = main_chunks[0].height.saturating_sub(2) as usize; // Account for borders
+        let total_messages = self.processor.messages.len();
+        
+        let visible_messages: Vec<ListItem> = if total_messages == 0 {
+            vec![]
+                } else {
+            // end index is the most recent message index + 1 (slice end), adjusted by scroll_offset
+            let end_idx = total_messages.saturating_sub(self.scroll_offset);
+            // start index backs off by available height (or to 0 if fewer messages)
+            let start_idx = end_idx.saturating_sub(available_height);
+            let start_idx = start_idx.min(total_messages);
+            let end_idx = end_idx.min(total_messages);
+            
+            if start_idx < end_idx {
+                self.processor.messages.range(start_idx..end_idx)
+                    .map(|m| ListItem::new(Line::from(Span::raw(m))))
+                    .collect()
+            } else {
+                vec![]
+            }
+        };
+
+        let scroll_indicator = if !self.auto_scroll && self.scroll_offset > 0 {
+            format!(" Chat - {} (↑{}) ", self.processor.nickname, self.scroll_offset)
+                        } else {
+            format!(" Chat - {} ", self.processor.nickname)
+        };
 
         let messages_block = Block::default()
             .borders(Borders::ALL)
-            .title(format!(" Chat - {} ", self.nickname));
+            .title(scroll_indicator);
 
-        let messages_list = List::new(messages).block(messages_block);
+        let messages_list = List::new(visible_messages).block(messages_block);
         f.render_widget(messages_list, main_chunks[0]);
 
         // Input
@@ -650,7 +831,7 @@ impl TuiChatClient {
 
         let input_block = Block::default()
             .borders(Borders::ALL)
-            .title(" Type message ");
+            .title(" Type message (↑↓ scroll, Ctrl+Q quit) ");
 
         let input_paragraph = Paragraph::new(input_with_cursor)
             .block(input_block)
@@ -659,15 +840,15 @@ impl TuiChatClient {
         f.render_widget(input_paragraph, main_chunks[1]);
 
         // Status
-        let cert_indicator = if self.allow_self_signed {
+        let cert_indicator = if self.connection.allow_self_signed {
             "⚠️ SS cert"
-        } else {
+                } else {
             "🔒 Cert"
         };
         
         let status_bar = Paragraph::new(format!(" {} | Key: {} | Cert: {} | {}", 
-            self.status,
-            if self.key_registered { "✅" } else { "❌" },
+            self.processor.status,
+            if self.processor.key_registered { "✅" } else { "❌" },
             CERT_PATH,
             cert_indicator
         ))
@@ -677,8 +858,8 @@ impl TuiChatClient {
     }
 
     fn send_message(&mut self, message: String) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(ref tx) = self.tx_write {
-            self.sign_and_send_message(&message, tx)?;
+        if let Some(ref tx) = self.connection.tx_write {
+            self.processor.sign_and_send_message(&message, tx)?;
         }
         Ok(())
     }
@@ -751,23 +932,6 @@ fn debug_log(msg: &str) {
     if DEBUG.load(std::sync::atomic::Ordering::Relaxed) {
         println!("[DEBUG] {}", msg);
     }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct UserStatus {
-    pub id: usize,
-    pub nickname: String,
-    pub state: String,
-    pub last_seen: u64,
-    pub nickname_changed: bool,
-    pub old_nickname: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct StatusResponse {
-    pub timestamp: u64,
-    pub users: Vec<UserStatus>,
-    pub total_users: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
